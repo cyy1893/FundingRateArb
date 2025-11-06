@@ -1,66 +1,423 @@
-import Image from "next/image";
-import styles from "./page.module.css";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { PerpTable } from "@/components/perp-table";
+import { SettlementCountdown } from "@/components/settlement-countdown";
+import {
+  DEFAULT_FUNDING_PERIOD_HOURS,
+  computeNextSettlementTimestamp,
+} from "@/lib/funding";
+import type { MarketRow } from "@/types/market";
 
-export default function Home() {
+type UniverseAsset = {
+  name: string;
+  maxLeverage: number;
+  isDelisted?: boolean;
+};
+
+type MetaPayload = {
+  universe: UniverseAsset[];
+};
+
+type AssetContext = {
+  markPx: string;
+  dayNtlVlm: string;
+  funding: string;
+  openInterest: string;
+};
+
+type MetaAndAssetCtxsResponse = [MetaPayload, AssetContext[]];
+
+type PerpSnapshot = {
+  rows: MarketRow[];
+  fetchedAt: Date;
+};
+
+type BinancePerpMetrics = {
+  maxLeverage: number | null;
+  fundingRate: number | null;
+};
+
+type CoingeckoMarket = {
+  id: string;
+  name: string;
+  image: string | null;
+  symbol: string;
+  total_volume: number;
+  price_change_percentage_1h_in_currency?: number | null;
+  price_change_percentage_24h_in_currency?: number | null;
+  price_change_percentage_7d_in_currency?: number | null;
+};
+
+async function getBinancePerpMetrics(): Promise<
+  Map<string, BinancePerpMetrics>
+> {
+  try {
+    const [exchangeInfoRes, premiumRes] = await Promise.all([
+      fetch("https://fapi.binance.com/fapi/v1/exchangeInfo", {
+        cache: "no-store",
+      }),
+      fetch("https://fapi.binance.com/fapi/v1/premiumIndex", {
+        cache: "no-store",
+      }),
+    ]);
+
+    if (!exchangeInfoRes.ok || !premiumRes.ok) {
+      return new Map();
+    }
+
+    const exchangeInfo = (await exchangeInfoRes.json()) as {
+      symbols?: Array<{
+        symbol: string;
+        quoteAsset: string;
+        contractType: string;
+        filters?: Array<{ filterType: string; maxLeverage?: string }>;
+      }>;
+    };
+
+    const leverageMap = new Map<string, number | null>();
+    exchangeInfo.symbols
+      ?.filter(
+        (item) =>
+          item.contractType === "PERPETUAL" && item.quoteAsset === "USDC",
+      )
+      .forEach((item) => {
+        const leverageFilter = item.filters?.find(
+          (filter) => filter.filterType === "LEVERAGE",
+        );
+        const maxLeverage = leverageFilter?.maxLeverage
+          ? Number.parseInt(leverageFilter.maxLeverage, 10)
+          : null;
+        leverageMap.set(item.symbol, Number.isNaN(maxLeverage) ? null : maxLeverage);
+      });
+
+    const premiumIndex = (await premiumRes.json()) as Array<{
+      symbol: string;
+      lastFundingRate: string;
+    }>;
+
+    const fundingMap = new Map<string, number | null>();
+    premiumIndex
+      ?.filter((item) => item.symbol.endsWith("USDC"))
+      .forEach((item) => {
+        const funding = Number.parseFloat(item.lastFundingRate);
+        fundingMap.set(item.symbol, Number.isFinite(funding) ? funding : null);
+      });
+
+    const combined = new Map<string, BinancePerpMetrics>();
+    const symbols = new Set([...leverageMap.keys(), ...fundingMap.keys()]);
+    symbols.forEach((symbol) => {
+      combined.set(symbol, {
+        maxLeverage: leverageMap.get(symbol) ?? null,
+        fundingRate: fundingMap.get(symbol) ?? null,
+      });
+    });
+
+    return combined;
+  } catch {
+    return new Map();
+  }
+}
+
+const API_URL = "https://api.hyperliquid.xyz/info";
+const COINGECKO_MARKETS_URL =
+  "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&per_page=250&sparkline=false&price_change_percentage=1h,24h,7d";
+
+type CoinGeckoSnapshot = {
+  id: string;
+  name: string;
+  image: string | null;
+  symbol: string;
+  volumeUsd: number | null;
+  priceChange1h: number | null;
+  priceChange24h: number | null;
+  priceChange7d: number | null;
+};
+
+async function getCoinGeckoMarketData(
+  symbols: string[],
+): Promise<Map<string, CoinGeckoSnapshot>> {
+  const targetSymbols = new Set(symbols.map((symbol) => symbol.toUpperCase()));
+  const markets = new Map<string, CoinGeckoSnapshot>();
+
+  if (targetSymbols.size === 0) {
+    return markets;
+  }
+
+  try {
+    const perPage = 250;
+    const maxPages = 4;
+
+    for (let page = 1; page <= maxPages && targetSymbols.size > 0; page += 1) {
+      const response = await fetch(`${COINGECKO_MARKETS_URL}&page=${page}`, {
+        cache: "no-store",
+      });
+
+      if (!response.ok) {
+        break;
+      }
+
+      const data = (await response.json()) as CoingeckoMarket[];
+      data.forEach((item) => {
+        const symbolUpper = item.symbol?.toUpperCase();
+        if (!symbolUpper || !targetSymbols.has(symbolUpper)) {
+          return;
+        }
+
+        const volume = Number(item.total_volume);
+        const priceChange1hRaw = item.price_change_percentage_1h_in_currency;
+        const priceChange24hRaw = item.price_change_percentage_24h_in_currency;
+        const priceChange7dRaw = item.price_change_percentage_7d_in_currency;
+
+        const snapshot: CoinGeckoSnapshot = {
+          id: item.id ?? symbolUpper.toLowerCase(),
+          name: item.name ?? symbolUpper,
+          image: item.image ?? null,
+          symbol: symbolUpper,
+          volumeUsd: Number.isFinite(volume) ? volume : null,
+          priceChange1h:
+            typeof priceChange1hRaw === "number" && Number.isFinite(priceChange1hRaw)
+              ? priceChange1hRaw
+              : null,
+          priceChange24h:
+            typeof priceChange24hRaw === "number" &&
+            Number.isFinite(priceChange24hRaw)
+              ? priceChange24hRaw
+              : null,
+          priceChange7d:
+            typeof priceChange7dRaw === "number" && Number.isFinite(priceChange7dRaw)
+              ? priceChange7dRaw
+              : null,
+        };
+
+        const existing = markets.get(symbolUpper);
+        const shouldUpdate =
+          existing == null ||
+          ((snapshot.volumeUsd ?? -Infinity) > (existing.volumeUsd ?? -Infinity));
+
+        if (shouldUpdate) {
+          markets.set(symbolUpper, snapshot);
+          targetSymbols.delete(symbolUpper);
+        }
+      });
+
+      if (data.length < perPage) {
+        break;
+      }
+    }
+  } catch {
+    return markets;
+  }
+
+  return markets;
+}
+
+async function getPerpetualSnapshot(): Promise<PerpSnapshot> {
+  const response = await fetch(API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ type: "metaAndAssetCtxs" }),
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error(`Hyperliquid API responded with ${response.status}`);
+  }
+
+  const raw = (await response.json()) as MetaAndAssetCtxsResponse | unknown;
+
+  if (
+    !Array.isArray(raw) ||
+    raw.length < 2 ||
+    typeof raw[0] !== "object" ||
+    raw[0] === null ||
+    !Array.isArray(raw[1])
+  ) {
+    throw new Error("Unexpected data shape received from Hyperliquid API");
+  }
+
+  const [meta, contexts] = raw as MetaAndAssetCtxsResponse;
+  const fetchedAt = new Date();
+  const [binanceMetrics, coingeckoMarkets] = await Promise.all([
+    getBinancePerpMetrics(),
+    getCoinGeckoMarketData(meta.universe.map((asset) => asset.name)),
+  ]);
+
+  const rows: MarketRow[] = meta.universe
+    .map((asset, index) => {
+      if (!asset || asset.isDelisted) {
+        return null;
+      }
+
+      const ctx = contexts[index];
+      if (!ctx) {
+        return null;
+      }
+
+      const markPrice = Number.parseFloat(ctx.markPx);
+      const dayNotionalVolume = Number.parseFloat(ctx.dayNtlVlm);
+      const fundingRate = Number.parseFloat(ctx.funding);
+      const openInterest = Number.parseFloat(ctx.openInterest);
+      const binanceSymbol = `${asset.name}USDC`;
+      const binanceInfo = binanceMetrics.get(binanceSymbol);
+      const binanceHourlyFunding =
+        binanceInfo?.fundingRate != null
+          ? binanceInfo.fundingRate / DEFAULT_FUNDING_PERIOD_HOURS
+          : null;
+      const hasBinanceData =
+        binanceInfo != null &&
+        (binanceInfo.maxLeverage !== null || binanceHourlyFunding !== null);
+
+      const binanceData =
+        binanceInfo != null && hasBinanceData
+          ? {
+              symbol: binanceSymbol,
+              maxLeverage: binanceInfo.maxLeverage,
+              fundingRate:
+                binanceHourlyFunding !== null &&
+                Number.isFinite(binanceHourlyFunding)
+                  ? binanceHourlyFunding
+                  : null,
+            }
+          : null;
+      const coingeckoEntry =
+        coingeckoMarkets.get(asset.name.toUpperCase()) ?? null;
+
+      return {
+        symbol: asset.name,
+        displayName: coingeckoEntry?.name ?? asset.name,
+        iconUrl: coingeckoEntry?.image ?? null,
+        coingeckoId: coingeckoEntry?.id ?? null,
+        maxLeverage: asset.maxLeverage,
+        markPrice: Number.isFinite(markPrice) ? markPrice : 0,
+        priceChange1h: coingeckoEntry?.priceChange1h ?? null,
+        priceChange24h: coingeckoEntry?.priceChange24h ?? null,
+        priceChange7d: coingeckoEntry?.priceChange7d ?? null,
+        dayNotionalVolume: Number.isFinite(dayNotionalVolume)
+          ? dayNotionalVolume
+          : 0,
+        fundingRate: Number.isFinite(fundingRate) ? fundingRate : 0,
+        openInterest: Number.isFinite(openInterest) ? openInterest : 0,
+        spotVolumeUsd: coingeckoEntry?.volumeUsd ?? null,
+        binance: binanceData,
+      };
+    })
+    .filter((row): row is MarketRow => row !== null)
+    .sort((a, b) => {
+      const volumeA = a.spotVolumeUsd ?? a.dayNotionalVolume ?? 0;
+      const volumeB = b.spotVolumeUsd ?? b.dayNotionalVolume ?? 0;
+      return volumeB - volumeA;
+    });
+
+  return {
+    rows,
+    fetchedAt,
+  };
+}
+
+export const revalidate = 0;
+
+export default async function Home() {
+  let snapshot: PerpSnapshot | null = null;
+  let errorMessage: string | null = null;
+
+  try {
+    snapshot = await getPerpetualSnapshot();
+  } catch (error) {
+    errorMessage =
+      error instanceof Error
+        ? error.message
+        : "无法加载 Hyperliquid 市场数据。";
+  }
+
+  const rows = snapshot?.rows ?? [];
+  const fetchedAt = snapshot?.fetchedAt ?? new Date();
+  const hyperSettlementPeriodHours = 1;
+  const binanceSettlementPeriodHours = 8;
+  const nextHyperSettlementIso = computeNextSettlementTimestamp(
+    fetchedAt,
+    hyperSettlementPeriodHours,
+  );
+  const nextBinanceSettlementIso = computeNextSettlementTimestamp(
+    fetchedAt,
+    binanceSettlementPeriodHours,
+  );
+
+  const lastUpdated = new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+  }).format(fetchedAt);
+
   return (
-    <div className={styles.page}>
-      <main className={styles.main}>
-        <Image
-          className={styles.logo}
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className={styles.intro}>
-          <h1>To get started, edit the page.tsx file.</h1>
-          <p>
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className={styles.ctas}>
-          <a
-            className={styles.primary}
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className={styles.logo}
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className={styles.secondary}
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+    <div className="min-h-screen bg-muted/20 py-10">
+      <div className="container mx-auto flex max-w-7xl flex-col gap-6 px-4">
+        <Card className="border-border/60">
+          <CardHeader className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+            <div className="space-y-2">
+              <CardTitle className="text-2xl font-semibold tracking-tight">
+                Hyperliquid 永续合约总览
+              </CardTitle>
+              <CardDescription className="max-w-2xl text-sm text-muted-foreground">
+                极简 toB 面板展示 Hyperliquid 交易所永续合约的核心指标。数据实时获取自
+                Hyperliquid Info API。
+              </CardDescription>
+            </div>
+            <div className="rounded-lg border border-border/70 bg-muted/40 px-4 py-3 text-sm">
+              <div className="flex flex-col gap-3 text-muted-foreground">
+                <div className="flex items-center justify-between gap-8">
+                  <div className="flex flex-col gap-1">
+                    <span className="uppercase tracking-wide text-xs">
+                      Hyperliquid 资金结算（{hyperSettlementPeriodHours} 小时）
+                    </span>
+                    <SettlementCountdown
+                      targetIso={nextHyperSettlementIso}
+                      className="text-lg"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <span className="uppercase tracking-wide text-xs">
+                      Binance 资金结算（{binanceSettlementPeriodHours} 小时）
+                    </span>
+                    <SettlementCountdown
+                      targetIso={nextBinanceSettlementIso}
+                      className="text-lg"
+                    />
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1 text-xs">
+                  <span className="uppercase tracking-wide">最近更新</span>
+                  <span className="font-medium text-foreground">{lastUpdated}</span>
+                </div>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {errorMessage ? (
+              <Alert variant="destructive">
+                <AlertTitle>数据获取失败</AlertTitle>
+                <AlertDescription>
+                  请求失败：{errorMessage}，请稍后重试。
+                </AlertDescription>
+              </Alert>
+            ) : (
+              <PerpTable
+                rows={rows}
+                defaultPeriodHours={DEFAULT_FUNDING_PERIOD_HOURS}
+              />
+            )}
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }
