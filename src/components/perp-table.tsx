@@ -15,6 +15,7 @@ import {
   ArrowUpRight,
   ChevronDown,
   ChevronUp,
+  Loader2,
   Minus,
 } from "lucide-react";
 
@@ -232,6 +233,7 @@ export function PerpTable({
     binance: {},
   });
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const [isBlockingRefresh, setIsBlockingRefresh] = useState(false);
 
   const normalizedSearch = search.trim().toLowerCase();
 
@@ -273,25 +275,6 @@ export function PerpTable({
 
   const handleExchangeFilterChange = (event: ChangeEvent<HTMLInputElement>) => {
     setExchangeFilter(event.target.value as ExchangeFilter);
-    setPage(1);
-  };
-
-  const cycleSort = (column: SortColumn) => {
-    if (sortColumn !== column) {
-      setSortColumn(column);
-      setSortDirection("desc");
-      setPage(1);
-      return;
-    }
-
-    if (sortDirection === "desc") {
-      setSortDirection("asc");
-      setPage(1);
-      return;
-    }
-
-    setSortColumn(null);
-    setSortDirection("desc");
     setPage(1);
   };
 
@@ -457,21 +440,6 @@ export function PerpTable({
       .filter((symbol): symbol is string => Boolean(symbol));
   }, [currentRows]);
 
-  const visibleKey = useMemo(() => {
-    const hyperKey = [...new Set(currentRows.map((row) => row.symbol.toUpperCase()))]
-      .sort()
-      .join("|");
-    const binanceKey = [
-      ...new Set(
-        currentRows
-          .map((row) => row.binance?.symbol)
-          .filter((symbol): symbol is string => Boolean(symbol)),
-      ),
-    ]
-      .sort()
-      .join("|");
-    return `${hyperKey}::${binanceKey}`;
-  }, [currentRows]);
   const showingFrom = sortedLength === 0 ? 0 : startIndex + 1;
   const showingTo = startIndex + currentRows.length;
   const paginationRange = useMemo(() => {
@@ -521,6 +489,18 @@ export function PerpTable({
       }
 
       if (isFetchingRef.current) {
+        if (force) {
+          await new Promise<void>((resolve) => {
+            const check = () => {
+              if (!isFetchingRef.current) {
+                resolve();
+              } else {
+                window.setTimeout(check, 50);
+              }
+            };
+            check();
+          });
+        }
         return;
       }
 
@@ -546,20 +526,32 @@ export function PerpTable({
     [],
   );
 
-  useEffect(() => {
-    if (!visibleKey) {
+  const triggerBlockingRefresh = useCallback(() => {
+    setIsBlockingRefresh(true);
+    fetchLatestFunding(true).finally(() => setIsBlockingRefresh(false));
+  }, [fetchLatestFunding]);
+
+  const cycleSort = (column: SortColumn) => {
+    if (sortColumn !== column) {
+      setSortColumn(column);
+      setSortDirection("desc");
+      setPage(1);
+      triggerBlockingRefresh();
       return;
     }
 
-    fetchLatestFunding(true);
-    const intervalId = window.setInterval(() => {
-      fetchLatestFunding();
-    }, FETCH_INTERVAL_MS);
+    if (sortDirection === "desc") {
+      setSortDirection("asc");
+      setPage(1);
+      triggerBlockingRefresh();
+      return;
+    }
 
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [visibleKey, fetchLatestFunding]);
+    setSortColumn(null);
+    setSortDirection("desc");
+    setPage(1);
+    triggerBlockingRefresh();
+  };
 
   return (
     <TooltipProvider delayDuration={150}>
@@ -582,6 +574,15 @@ export function PerpTable({
             ) : null}
           </div>
           <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              className="min-w-[110px]"
+              onClick={triggerBlockingRefresh}
+              disabled={isBlockingRefresh}
+            >
+              {isBlockingRefresh ? "刷新中…" : "刷新数据"}
+            </Button>
+
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -654,6 +655,7 @@ export function PerpTable({
                 </div>
               </DialogContent>
             </Dialog>
+
           </div>
         </div>
 
@@ -704,8 +706,16 @@ export function PerpTable({
           </div>
         </div>
 
-        <div className="rounded-xl border">
-          <Table className="text-sm">
+        <div className="relative rounded-xl border">
+          {isBlockingRefresh ? (
+            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-background/80 backdrop-blur-sm">
+              <div className="flex flex-col items-center gap-2 text-muted-foreground">
+                <Loader2 className="h-6 w-6 animate-spin" />
+                <span className="text-xs font-medium">刷新…</span>
+              </div>
+            </div>
+          ) : null}
+          <Table className={cn("text-sm", isBlockingRefresh && "pointer-events-none opacity-50")}>
             <TableHeader>
               <TableRow className="bg-muted/50 text-xs uppercase tracking-wide text-muted-foreground">
                 <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
@@ -862,14 +872,14 @@ export function PerpTable({
 
                 return (
                   <TableRow key={row.symbol} className="hover:bg-muted/40">
-                    <TableCell className="py-3 text-sm font-semibold text-foreground">
+                    <TableCell className="py-3 text-sm font-semibold text-foreground min-w-[190px]">
                       {coingeckoUrl ? (
                         <div className="flex items-center gap-2.5">
                           <a
                             href={coingeckoUrl}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-border/30 bg-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                            className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full border border-border/30 bg-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
                           >
                             {row.iconUrl ? (
                               <img
@@ -884,16 +894,16 @@ export function PerpTable({
                               </span>
                             )}
                           </a>
-                          <div className="flex flex-col">
+                          <div className="flex flex-col overflow-hidden">
                             <a
                               href={coingeckoUrl}
                               target="_blank"
                               rel="noreferrer"
-                              className="text-sm font-semibold text-foreground transition hover:text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                              className="truncate text-sm font-semibold text-foreground transition hover:text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                             >
                               {row.displayName}
                             </a>
-                            <span className="text-[11px] uppercase text-muted-foreground">
+                            <span className="truncate text-[11px] uppercase text-muted-foreground">
                               {row.symbol}
                             </span>
                           </div>
@@ -904,7 +914,7 @@ export function PerpTable({
                             <img
                               src={row.iconUrl}
                               alt={`${row.displayName} 图标`}
-                              className="h-7 w-7 rounded-full border border-border/30 bg-background object-contain"
+                              className="h-7 w-7 flex-shrink-0 rounded-full border border-border/30 bg-background object-contain"
                               loading="lazy"
                             />
                           ) : (
@@ -912,11 +922,11 @@ export function PerpTable({
                               {row.symbol.slice(0, 3)}
                             </div>
                           )}
-                          <div className="flex flex-col">
-                            <span className="text-sm font-semibold text-foreground">
+                          <div className="flex flex-col overflow-hidden">
+                            <span className="truncate text-sm font-semibold text-foreground">
                               {row.displayName}
                             </span>
-                            <span className="text-[11px] uppercase text-muted-foreground">
+                            <span className="truncate text-[11px] uppercase text-muted-foreground">
                               {row.symbol}
                             </span>
                           </div>
