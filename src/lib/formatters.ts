@@ -16,6 +16,12 @@ const compactUsdFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 });
 
+const percentSigFormatter = new Intl.NumberFormat("en-US", {
+  minimumSignificantDigits: 1,
+  maximumSignificantDigits: 3,
+  useGrouping: false,
+});
+
 export function formatPrice(value: number): string {
   if (!Number.isFinite(value)) {
     return "—";
@@ -58,11 +64,8 @@ export function formatFundingRate(rate: number): string {
   }
 
   const percentValue = rate * 100;
-  const formatted =
-    Math.abs(percentValue) >= 0.001
-      ? percentValue.toFixed(3)
-      : percentValue.toFixed(5);
-  return `${formatted.replace(/\.?0+$/, "")}%`;
+  const formatted = percentSigFormatter.format(percentValue);
+  return `${formatted}%`;
 }
 
 export function describeFundingDirection(rate: number): string {
