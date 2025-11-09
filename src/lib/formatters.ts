@@ -1,3 +1,5 @@
+import { DEFAULT_FUNDING_PERIOD_HOURS } from "./funding";
+
 const priceFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",
   currency: "USD",
@@ -21,6 +23,9 @@ const percentSigFormatter = new Intl.NumberFormat("en-US", {
   maximumSignificantDigits: 3,
   useGrouping: false,
 });
+
+const HOURS_PER_DAY = 24;
+const DAYS_PER_YEAR = 365;
 
 export function formatPrice(value: number): string {
   if (!Number.isFinite(value)) {
@@ -76,29 +81,41 @@ export function describeFundingDirection(rate: number): string {
   return rate > 0 ? "多头向空头支付" : "空头向多头支付";
 }
 
-export function formatAnnualizedFunding(rate: number): string {
-  if (!Number.isFinite(rate)) {
+export function formatAnnualizedFunding(
+  rate: number,
+  intervalHours: number = 1,
+): string {
+  if (
+    !Number.isFinite(rate) ||
+    !Number.isFinite(intervalHours) ||
+    intervalHours <= 0
+  ) {
     return "年化 —";
   }
 
-  const annualized = Math.abs(rate) * 3 * 365 * 100;
+  const periodsPerYear = (HOURS_PER_DAY / intervalHours) * DAYS_PER_YEAR;
+  const annualized = Math.abs(rate) * periodsPerYear * 100;
   const formatted =
-    Math.abs(annualized) >= 0.01
-      ? annualized.toFixed(3)
-      : annualized.toFixed(5);
+    Math.abs(annualized) >= 0.01 ? annualized.toFixed(3) : annualized.toFixed(5);
   return `年化 ${formatted.replace(/\.?0+$/, "")}%`;
 }
 
-export function computeAnnualizedPercent(rate: number): string {
-  if (!Number.isFinite(rate)) {
+export function computeAnnualizedPercent(
+  rate: number,
+  periodHours: number = DEFAULT_FUNDING_PERIOD_HOURS,
+): string {
+  if (
+    !Number.isFinite(rate) ||
+    !Number.isFinite(periodHours) ||
+    periodHours <= 0
+  ) {
     return "—";
   }
 
-  const annualized = Math.abs(rate) * 3 * 365 * 100;
+  const periodsPerYear = (HOURS_PER_DAY / periodHours) * DAYS_PER_YEAR;
+  const annualized = Math.abs(rate) * periodsPerYear * 100;
   const formatted =
-    Math.abs(annualized) >= 0.01
-      ? annualized.toFixed(3)
-      : annualized.toFixed(5);
+    Math.abs(annualized) >= 0.01 ? annualized.toFixed(3) : annualized.toFixed(5);
   return `${formatted.replace(/\.?0+$/, "")}%`;
 }
 

@@ -9,12 +9,14 @@ export type MarketRow = {
   priceChange7d: number | null;
   maxLeverage: number;
   fundingRate: number;
-  dayNotionalVolume: number;
+  dayNotionalVolume: number | null;
   openInterest: number;
-  spotVolumeUsd: number | null;
-  binance?: {
+  volumeUsd: number | null;
+  binance: {
     symbol: string;
     maxLeverage: number | null;
     fundingRate: number | null;
+    volumeUsd: number | null;
+    fundingPeriodHours: number | null;
   } | null;
 };

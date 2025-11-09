@@ -41,6 +41,8 @@ type PerpSnapshot = {
 type BinancePerpMetrics = {
   maxLeverage: number | null;
   fundingRate: number | null;
+  fundingIntervalHours: number | null;
+  volumeUsd: number | null;
 };
 
 type CoingeckoMarket = {
@@ -58,14 +60,21 @@ async function getBinancePerpMetrics(): Promise<
   Map<string, BinancePerpMetrics>
 > {
   try {
-    const [exchangeInfoRes, premiumRes] = await Promise.all([
-      fetch("https://fapi.binance.com/fapi/v1/exchangeInfo", {
-        cache: "no-store",
-      }),
-      fetch("https://fapi.binance.com/fapi/v1/premiumIndex", {
-        cache: "no-store",
-      }),
-    ]);
+    const [exchangeInfoRes, premiumRes, fundingInfoRes, tickerRes] =
+      await Promise.all([
+        fetch("https://fapi.binance.com/fapi/v1/exchangeInfo", {
+          cache: "no-store",
+        }),
+        fetch("https://fapi.binance.com/fapi/v1/premiumIndex", {
+          cache: "no-store",
+        }),
+        fetch("https://fapi.binance.com/fapi/v1/fundingInfo", {
+          cache: "no-store",
+        }),
+        fetch("https://fapi.binance.com/fapi/v1/ticker/24hr", {
+          cache: "no-store",
+        }),
+      ]);
 
     if (!exchangeInfoRes.ok || !premiumRes.ok) {
       return new Map();
@@ -109,12 +118,61 @@ async function getBinancePerpMetrics(): Promise<
         fundingMap.set(item.symbol, Number.isFinite(funding) ? funding : null);
       });
 
+    const fundingIntervalMap = new Map<string, number | null>();
+    if (fundingInfoRes.ok) {
+      const fundingInfo = (await fundingInfoRes.json()) as Array<{
+        symbol: string;
+        fundingIntervalHours?: number | string;
+      }>;
+
+      fundingInfo
+        ?.filter((item) => item.symbol.endsWith("USDC"))
+        .forEach((item) => {
+          const hours =
+            typeof item.fundingIntervalHours === "string"
+              ? Number.parseInt(item.fundingIntervalHours, 10)
+              : item.fundingIntervalHours;
+          fundingIntervalMap.set(
+            item.symbol,
+            hours != null && Number.isFinite(hours) ? hours : null,
+          );
+        });
+    }
+
+    const volumeMap = new Map<string, number | null>();
+    if (tickerRes.ok) {
+      const tickerData = (await tickerRes.json()) as Array<{
+        symbol: string;
+        quoteVolume?: string;
+        volume?: string;
+      }>;
+
+      tickerData
+        ?.filter((item) => item.symbol.endsWith("USDC"))
+        .forEach((item) => {
+          const volume = Number.parseFloat(
+            item.quoteVolume ?? item.volume ?? "",
+          );
+          volumeMap.set(
+            item.symbol,
+            Number.isFinite(volume) && volume >= 0 ? volume : null,
+          );
+        });
+    }
+
     const combined = new Map<string, BinancePerpMetrics>();
-    const symbols = new Set([...leverageMap.keys(), ...fundingMap.keys()]);
+    const symbols = new Set([
+      ...leverageMap.keys(),
+      ...fundingMap.keys(),
+      ...fundingIntervalMap.keys(),
+      ...volumeMap.keys(),
+    ]);
     symbols.forEach((symbol) => {
       combined.set(symbol, {
         maxLeverage: leverageMap.get(symbol) ?? null,
         fundingRate: fundingMap.get(symbol) ?? null,
+        fundingIntervalHours: fundingIntervalMap.get(symbol) ?? null,
+        volumeUsd: volumeMap.get(symbol) ?? null,
       });
     });
 
@@ -250,71 +308,92 @@ async function getPerpetualSnapshot(): Promise<PerpSnapshot> {
     getCoinGeckoMarketData(meta.universe.map((asset) => asset.name)),
   ]);
 
-  const rows: MarketRow[] = meta.universe
-    .map((asset, index) => {
-      if (!asset || asset.isDelisted) {
-        return null;
-      }
+  const rows: MarketRow[] = [];
 
-      const ctx = contexts[index];
-      if (!ctx) {
-        return null;
-      }
+  meta.universe.forEach((asset, index) => {
+    if (!asset || asset.isDelisted) {
+      return;
+    }
 
-      const markPrice = Number.parseFloat(ctx.markPx);
-      const dayNotionalVolume = Number.parseFloat(ctx.dayNtlVlm);
-      const fundingRate = Number.parseFloat(ctx.funding);
-      const openInterest = Number.parseFloat(ctx.openInterest);
-      const binanceSymbol = `${asset.name}USDC`;
-      const binanceInfo = binanceMetrics.get(binanceSymbol);
-      const binanceHourlyFunding =
-        binanceInfo?.fundingRate != null
-          ? binanceInfo.fundingRate / DEFAULT_FUNDING_PERIOD_HOURS
-          : null;
-      const hasBinanceData =
-        binanceInfo != null &&
-        (binanceInfo.maxLeverage !== null || binanceHourlyFunding !== null);
+    const ctx = contexts[index];
+    if (!ctx) {
+      return;
+    }
 
-      const binanceData =
-        binanceInfo != null && hasBinanceData
-          ? {
-              symbol: binanceSymbol,
-              maxLeverage: binanceInfo.maxLeverage,
-              fundingRate:
-                binanceHourlyFunding !== null &&
-                Number.isFinite(binanceHourlyFunding)
-                  ? binanceHourlyFunding
-                  : null,
-            }
-          : null;
-      const coingeckoEntry =
-        coingeckoMarkets.get(asset.name.toUpperCase()) ?? null;
+    const markPrice = Number.parseFloat(ctx.markPx);
+    const dayNotionalVolumeRaw = Number.parseFloat(ctx.dayNtlVlm);
+    const dayNotionalVolume = Number.isFinite(dayNotionalVolumeRaw)
+      ? dayNotionalVolumeRaw
+      : null;
+    const fundingRate = Number.parseFloat(ctx.funding);
+    const openInterest = Number.parseFloat(ctx.openInterest);
+    const binanceSymbol = `${asset.name}USDC`;
+    const binanceInfo = binanceMetrics.get(binanceSymbol);
+    const fundingPeriodHours =
+      binanceInfo?.fundingIntervalHours ?? DEFAULT_FUNDING_PERIOD_HOURS;
+    const binanceHourlyFunding =
+      binanceInfo?.fundingRate != null
+        ? binanceInfo.fundingRate / Math.max(fundingPeriodHours, 1)
+        : null;
+    const binanceVolumeUsd =
+      binanceInfo?.volumeUsd != null && Number.isFinite(binanceInfo.volumeUsd)
+        ? binanceInfo.volumeUsd
+        : null;
+    const combinedVolumeUsd =
+      dayNotionalVolume !== null || binanceVolumeUsd !== null
+        ? (dayNotionalVolume ?? 0) + (binanceVolumeUsd ?? 0)
+        : null;
+    const hasBinanceData =
+      binanceInfo != null &&
+      (binanceInfo.maxLeverage !== null ||
+        binanceHourlyFunding !== null ||
+        binanceVolumeUsd !== null);
 
-      return {
-        symbol: asset.name,
-        displayName: coingeckoEntry?.name ?? asset.name,
-        iconUrl: coingeckoEntry?.image ?? null,
-        coingeckoId: coingeckoEntry?.id ?? null,
-        maxLeverage: asset.maxLeverage,
-        markPrice: Number.isFinite(markPrice) ? markPrice : 0,
-        priceChange1h: coingeckoEntry?.priceChange1h ?? null,
-        priceChange24h: coingeckoEntry?.priceChange24h ?? null,
-        priceChange7d: coingeckoEntry?.priceChange7d ?? null,
-        dayNotionalVolume: Number.isFinite(dayNotionalVolume)
-          ? dayNotionalVolume
-          : 0,
-        fundingRate: Number.isFinite(fundingRate) ? fundingRate : 0,
-        openInterest: Number.isFinite(openInterest) ? openInterest : 0,
-        spotVolumeUsd: coingeckoEntry?.volumeUsd ?? null,
-        binance: binanceData,
-      };
-    })
-    .filter((row): row is MarketRow => row !== null)
-    .sort((a, b) => {
-      const volumeA = a.spotVolumeUsd ?? a.dayNotionalVolume ?? 0;
-      const volumeB = b.spotVolumeUsd ?? b.dayNotionalVolume ?? 0;
-      return volumeB - volumeA;
-    });
+    const binanceData: MarketRow["binance"] =
+      binanceInfo != null && hasBinanceData
+        ? {
+            symbol: binanceSymbol,
+            maxLeverage: binanceInfo.maxLeverage,
+            fundingRate:
+              binanceHourlyFunding !== null &&
+              Number.isFinite(binanceHourlyFunding)
+                ? binanceHourlyFunding
+                : null,
+            volumeUsd: binanceVolumeUsd,
+            fundingPeriodHours:
+              Number.isFinite(fundingPeriodHours) && fundingPeriodHours > 0
+                ? fundingPeriodHours
+                : null,
+          }
+        : null;
+    const coingeckoEntry =
+      coingeckoMarkets.get(asset.name.toUpperCase()) ?? null;
+
+    const row: MarketRow = {
+      symbol: asset.name,
+      displayName: coingeckoEntry?.name ?? asset.name,
+      iconUrl: coingeckoEntry?.image ?? null,
+      coingeckoId: coingeckoEntry?.id ?? null,
+      maxLeverage: asset.maxLeverage,
+      markPrice: Number.isFinite(markPrice) ? markPrice : 0,
+      priceChange1h: coingeckoEntry?.priceChange1h ?? null,
+      priceChange24h: coingeckoEntry?.priceChange24h ?? null,
+      priceChange7d: coingeckoEntry?.priceChange7d ?? null,
+      dayNotionalVolume,
+      fundingRate: Number.isFinite(fundingRate) ? fundingRate : 0,
+      openInterest: Number.isFinite(openInterest) ? openInterest : 0,
+      volumeUsd: combinedVolumeUsd,
+      binance: binanceData,
+    };
+
+    rows.push(row);
+  });
+
+  rows.sort((a, b) => {
+    const volumeA = a.volumeUsd ?? a.dayNotionalVolume ?? 0;
+    const volumeB = b.volumeUsd ?? b.dayNotionalVolume ?? 0;
+    return volumeB - volumeA;
+  });
 
   return {
     rows,
@@ -339,15 +418,10 @@ export default async function Home() {
 
   const rows = snapshot?.rows ?? [];
   const fetchedAt = snapshot?.fetchedAt ?? new Date();
-  const hyperSettlementPeriodHours = 1;
-  const binanceSettlementPeriodHours = 8;
-  const nextHyperSettlementIso = computeNextSettlementTimestamp(
+  const settlementPeriodHours = 1;
+  const nextSettlementIso = computeNextSettlementTimestamp(
     fetchedAt,
-    hyperSettlementPeriodHours,
-  );
-  const nextBinanceSettlementIso = computeNextSettlementTimestamp(
-    fetchedAt,
-    binanceSettlementPeriodHours,
+    settlementPeriodHours,
   );
 
   const lastUpdated = new Intl.DateTimeFormat("en-US", {
@@ -377,19 +451,10 @@ export default async function Home() {
                 <div className="flex items-center justify-between gap-8">
                   <div className="flex flex-col gap-1">
                     <span className="uppercase tracking-wide text-xs">
-                      Hyperliquid 资金结算（{hyperSettlementPeriodHours} 小时）
+                      资金结算（整点）
                     </span>
                     <SettlementCountdown
-                      targetIso={nextHyperSettlementIso}
-                      className="text-lg"
-                    />
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <span className="uppercase tracking-wide text-xs">
-                      Binance 资金结算（{binanceSettlementPeriodHours} 小时）
-                    </span>
-                    <SettlementCountdown
-                      targetIso={nextBinanceSettlementIso}
+                      targetIso={nextSettlementIso}
                       className="text-lg"
                     />
                   </div>

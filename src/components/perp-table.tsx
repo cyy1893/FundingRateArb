@@ -84,6 +84,7 @@ type PerpTableProps = {
 
 const DEFAULT_PAGE_SIZE = 25;
 const FETCH_INTERVAL_MS = 15000;
+const SORT_REFRESH_CACHE_MS = 5000;
 
 type SortColumn =
   | "markPrice"
@@ -91,7 +92,8 @@ type SortColumn =
   | "funding"
   | "binanceFunding"
   | "arbitrage"
-  | "volume";
+  | "volumeHyperliquid"
+  | "volumeBinance";
 type ExchangeFilter = "intersection" | "any";
 
 type HyperliquidFundingResponse = [
@@ -163,21 +165,48 @@ async function fetchBinanceFundingRates(
   }
 
   try {
-    const response = await fetch("https://fapi.binance.com/fapi/v1/premiumIndex", {
-      cache: "no-store",
-    });
+    const [premiumRes, fundingInfoRes] = await Promise.all([
+      fetch("https://fapi.binance.com/fapi/v1/premiumIndex", {
+        cache: "no-store",
+      }),
+      fetch("https://fapi.binance.com/fapi/v1/fundingInfo", {
+        cache: "no-store",
+      }),
+    ]);
 
-    if (!response.ok) {
+    if (!premiumRes.ok) {
       return {};
     }
 
-    const data = (await response.json()) as Array<{
+    const data = (await premiumRes.json()) as Array<{
       symbol: string;
       lastFundingRate: string;
     }>;
 
     const targetSymbols = new Set(symbols);
     const funding: Record<string, number> = {};
+    const intervalMap: Record<string, number> = {};
+
+    if (fundingInfoRes.ok) {
+      const fundingInfo = (await fundingInfoRes.json()) as Array<{
+        symbol: string;
+        fundingIntervalHours?: number | string;
+      }>;
+
+      fundingInfo?.forEach((item) => {
+        if (!targetSymbols.has(item.symbol)) {
+          return;
+        }
+
+        const hours =
+          typeof item.fundingIntervalHours === "string"
+            ? Number.parseInt(item.fundingIntervalHours, 10)
+            : item.fundingIntervalHours;
+        if (hours != null && Number.isFinite(hours)) {
+          intervalMap[item.symbol] = hours;
+        }
+      });
+    }
 
     data.forEach((item) => {
       if (!targetSymbols.has(item.symbol)) {
@@ -186,7 +215,8 @@ async function fetchBinanceFundingRates(
 
       const parsed = Number.parseFloat(item.lastFundingRate);
       if (Number.isFinite(parsed)) {
-        funding[item.symbol] = parsed / DEFAULT_FUNDING_PERIOD_HOURS;
+        const intervalHours = intervalMap[item.symbol] ?? DEFAULT_FUNDING_PERIOD_HOURS;
+        funding[item.symbol] = parsed / Math.max(intervalHours, 1);
       }
     });
 
@@ -337,8 +367,10 @@ export function PerpTable({
           const binanceEightHour = binanceHourly * DEFAULT_FUNDING_PERIOD_HOURS;
           return Math.abs(hyperliquidEightHour - binanceEightHour);
         }
-        case "volume":
-          return row.spotVolumeUsd ?? Number.NEGATIVE_INFINITY;
+        case "volumeHyperliquid":
+          return row.dayNotionalVolume ?? Number.NEGATIVE_INFINITY;
+        case "volumeBinance":
+          return row.binance?.volumeUsd ?? Number.NEGATIVE_INFINITY;
         default:
           return 0;
       }
@@ -531,26 +563,33 @@ export function PerpTable({
     fetchLatestFunding(true).finally(() => setIsBlockingRefresh(false));
   }, [fetchLatestFunding]);
 
+  const triggerCachedSortRefresh = useCallback(() => {
+    if (Date.now() - lastFetchRef.current < SORT_REFRESH_CACHE_MS) {
+      return;
+    }
+    triggerBlockingRefresh();
+  }, [triggerBlockingRefresh]);
+
   const cycleSort = (column: SortColumn) => {
     if (sortColumn !== column) {
       setSortColumn(column);
       setSortDirection("desc");
       setPage(1);
-      triggerBlockingRefresh();
+      triggerCachedSortRefresh();
       return;
     }
 
     if (sortDirection === "desc") {
       setSortDirection("asc");
       setPage(1);
-      triggerBlockingRefresh();
+      triggerCachedSortRefresh();
       return;
     }
 
     setSortColumn(null);
     setSortDirection("desc");
     setPage(1);
-    triggerBlockingRefresh();
+    triggerCachedSortRefresh();
   };
 
   return (
@@ -783,11 +822,21 @@ export function PerpTable({
                 <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
                   <button
                     type="button"
-                    onClick={() => cycleSort("volume")}
-                      className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
+                    onClick={() => cycleSort("volumeHyperliquid")}
+                    className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
                   >
-                    <span>24 小时成交量</span>
-                    {renderSortIcon("volume")}
+                    <span>Hyperliquid 24 小时成交量</span>
+                    {renderSortIcon("volumeHyperliquid")}
+                  </button>
+                </TableHead>
+                <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
+                  <button
+                    type="button"
+                    onClick={() => cycleSort("volumeBinance")}
+                    className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
+                  >
+                    <span>Binance 24 小时成交量</span>
+                    {renderSortIcon("volumeBinance")}
                   </button>
                 </TableHead>
               </TableRow>
@@ -796,7 +845,7 @@ export function PerpTable({
               {currentRows.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={10}
+                    colSpan={11}
                     className="py-12 text-center text-sm text-muted-foreground"
                   >
                     未找到匹配的资产。
@@ -829,6 +878,7 @@ export function PerpTable({
                   binanceHourly !== null
                     ? binanceHourly * DEFAULT_FUNDING_PERIOD_HOURS
                     : null;
+                const binanceVolume = row.binance?.volumeUsd ?? null;
                 const arbDelta =
                   binanceEightHourFunding !== null
                     ? hyperEightHourFunding - binanceEightHourFunding
@@ -1057,13 +1107,18 @@ export function PerpTable({
                           </Badge>
                         )}
                       </TableCell>
-                      <TableCell className="font-medium">
-                        {formatVolume(row.spotVolumeUsd)}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })
-              )}
+                  <TableCell className="font-medium">
+                    {row.dayNotionalVolume !== null
+                      ? formatVolume(row.dayNotionalVolume)
+                      : "—"}
+                  </TableCell>
+                  <TableCell className="font-medium">
+                    {binanceVolume !== null ? formatVolume(binanceVolume) : "—"}
+                  </TableCell>
+                </TableRow>
+              );
+            })
+          )}
             </TableBody>
           </Table>
         </div>
