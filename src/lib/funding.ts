@@ -1,4 +1,4 @@
-export const DEFAULT_FUNDING_PERIOD_HOURS = 8;
+export const DEFAULT_FUNDING_PERIOD_HOURS = 1;
 
 export type FundingPeriodOption = {
   label: string;
@@ -7,7 +7,10 @@ export type FundingPeriodOption = {
 
 export const FUNDING_PERIOD_OPTIONS: FundingPeriodOption[] = [
   { label: "每小时", value: 1 },
-  { label: `${DEFAULT_FUNDING_PERIOD_HOURS}小时`, value: DEFAULT_FUNDING_PERIOD_HOURS },
+  {
+    label: `${DEFAULT_FUNDING_PERIOD_HOURS}小时`,
+    value: DEFAULT_FUNDING_PERIOD_HOURS,
+  },
 ];
 
 export const MS_PER_HOUR = 60 * 60 * 1000;

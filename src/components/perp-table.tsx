@@ -15,6 +15,7 @@ import {
   ArrowUpRight,
   ChevronDown,
   ChevronUp,
+  LineChart as LineChartIcon,
   Loader2,
   Minus,
 } from "lucide-react";
@@ -22,13 +23,6 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -60,10 +54,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import {
-  DEFAULT_FUNDING_PERIOD_HOURS,
-  FUNDING_PERIOD_OPTIONS,
-} from "@/lib/funding";
+import { DEFAULT_FUNDING_PERIOD_HOURS } from "@/lib/funding";
 import { cn } from "@/lib/utils";
 import {
   formatFundingRate,
@@ -75,16 +66,26 @@ import {
   formatPercentChange,
 } from "@/lib/formatters";
 import type { MarketRow } from "@/types/market";
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip as RechartsTooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
 type PerpTableProps = {
   rows: MarketRow[];
   pageSize?: number;
-  defaultPeriodHours?: number;
 };
 
 const DEFAULT_PAGE_SIZE = 15;
 const FETCH_INTERVAL_MS = 15000;
 const SORT_REFRESH_CACHE_MS = 5000;
+const DISPLAY_FUNDING_PERIOD_HOURS = 1;
 
 type SortColumn =
   | "markPrice"
@@ -106,6 +107,37 @@ type HyperliquidFundingResponse = [
     funding: string;
   }>
 ];
+
+type FundingHistoryPoint = {
+  time: number;
+  hyperliquid?: number | null;
+  binance?: number | null;
+  arbitrage?: number | null;
+};
+
+const HISTORY_OPTIONS = [
+  { label: "1 天", value: 1 },
+  { label: "1 周", value: 7 },
+  { label: "1 月", value: 30 },
+] as const;
+type HistoryOptionValue = (typeof HISTORY_OPTIONS)[number]["value"];
+
+const DEFAULT_HISTORY_RANGE_DAYS: HistoryOptionValue = 7;
+const MS_PER_HOUR = 60 * 60 * 1000;
+const ARBITRAGE_COLOR_WINDOW_HOURS = 8;
+
+const historyTickFormatter = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+});
+
+const historyTooltipFormatter = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+});
 
 async function fetchHyperliquidFundingRates(
   symbols: string[],
@@ -226,6 +258,132 @@ async function fetchBinanceFundingRates(
   }
 }
 
+function normalizeTimestampToHour(value: number): number {
+  return Math.floor(value / MS_PER_HOUR) * MS_PER_HOUR;
+}
+
+async function fetchHyperliquidFundingHistorySeries(
+  symbol: string,
+  startTime: number,
+): Promise<Array<{ time: number; rate: number }>> {
+  const response = await fetch("https://api.hyperliquid.xyz/info", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      type: "fundingHistory",
+      coin: symbol,
+      startTime,
+    }),
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error("Hyperliquid 资金费率历史请求失败");
+  }
+
+  const data = (await response.json()) as Array<{
+    time: number;
+    fundingRate: string;
+  }>;
+
+  return data
+    .map((entry) => {
+      const time = normalizeTimestampToHour(entry.time);
+      const rate = Number.parseFloat(entry.fundingRate);
+      return Number.isFinite(rate) ? { time, rate } : null;
+    })
+    .filter((point): point is { time: number; rate: number } => point !== null);
+}
+
+async function fetchBinanceFundingHistorySeries(
+  symbol: string,
+  startTime: number,
+): Promise<Array<{ time: number; rate: number }>> {
+  const params = new URLSearchParams({
+    symbol,
+    limit: "1000",
+  });
+  if (Number.isFinite(startTime)) {
+    params.set("startTime", `${startTime}`);
+  }
+
+  const response = await fetch(
+    `https://fapi.binance.com/fapi/v1/fundingRate?${params.toString()}`,
+    {
+      cache: "no-store",
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error("Binance 资金费率历史请求失败");
+  }
+
+  const data = (await response.json()) as Array<{
+    fundingRate: string;
+    fundingTime: number;
+  }>;
+
+  return data
+    .map((entry) => {
+      const time = normalizeTimestampToHour(entry.fundingTime);
+      const rate = Number.parseFloat(entry.fundingRate);
+      return Number.isFinite(rate) ? { time, rate } : null;
+    })
+    .filter((point): point is { time: number; rate: number } => point !== null);
+}
+
+async function fetchFundingHistoryDataset(
+  symbol: string,
+  binanceSymbol: string | null,
+  days: number,
+): Promise<FundingHistoryPoint[]> {
+  const startTime = Date.now() - days * 24 * MS_PER_HOUR;
+  const [hyperHistory, binanceHistory] = await Promise.all([
+    fetchHyperliquidFundingHistorySeries(symbol, startTime).catch(() => []),
+    binanceSymbol
+      ? fetchBinanceFundingHistorySeries(binanceSymbol, startTime).catch(
+          () => [],
+        )
+      : Promise.resolve([]),
+  ]);
+
+  if (hyperHistory.length === 0 && binanceHistory.length === 0) {
+    throw new Error("暂无可用的资金费率历史数据");
+  }
+
+  const merged = new Map<number, FundingHistoryPoint>();
+
+  hyperHistory.forEach(({ time, rate }) => {
+    const existing = merged.get(time) ?? { time };
+    existing.hyperliquid = rate * 100;
+    merged.set(time, existing);
+  });
+
+  binanceHistory.forEach(({ time, rate }) => {
+    const existing = merged.get(time) ?? { time };
+    existing.binance =
+      (rate / Math.max(DEFAULT_FUNDING_PERIOD_HOURS, 1)) * 100;
+    merged.set(time, existing);
+  });
+
+  const dataset = Array.from(merged.values()).map((entry) => {
+    if (
+      typeof entry.hyperliquid === "number" &&
+      typeof entry.binance === "number"
+    ) {
+      entry.arbitrage = entry.hyperliquid - entry.binance;
+    } else {
+      entry.arbitrage = null;
+    }
+
+    return entry;
+  });
+
+  return dataset.sort((a, b) => a.time - b.time);
+}
+
 const RATE_THRESHOLDS = {
   negative: 0,
   neutralUpperBound: 0.0001,
@@ -255,14 +413,16 @@ function formatSettlementPeriod(hours: number | null | undefined): string {
   return `${label} 小时`;
 }
 
+function getHistoryCacheKey(symbol: string, binanceSymbol: string | null) {
+  return `${symbol}__${binanceSymbol ?? "none"}`;
+}
+
 export function PerpTable({
   rows,
   pageSize = DEFAULT_PAGE_SIZE,
-  defaultPeriodHours = DEFAULT_FUNDING_PERIOD_HOURS,
 }: PerpTableProps) {
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
-  const [periodHours, setPeriodHours] = useState(defaultPeriodHours);
   const [sortColumn, setSortColumn] = useState<SortColumn | null>(null);
   const [sortDirection, setSortDirection] = useState<"desc" | "asc">("desc");
   const [exchangeFilter, setExchangeFilter] =
@@ -275,6 +435,26 @@ export function PerpTable({
     binance: {},
   });
   const [isBlockingRefresh, setIsBlockingRefresh] = useState(false);
+  const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
+  const [historyTarget, setHistoryTarget] = useState<{
+    symbol: string;
+    displayName: string;
+    binanceSymbol: string | null;
+  } | null>(null);
+  const [historyData, setHistoryData] = useState<FundingHistoryPoint[] | null>(
+    null,
+  );
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const historyCacheRef = useRef<
+    Record<string, Record<number, FundingHistoryPoint[]>>
+  >({});
+  const displayPeriodHours = DISPLAY_FUNDING_PERIOD_HOURS;
+  const [historyRangeDays, setHistoryRangeDays] =
+    useState<HistoryOptionValue>(DEFAULT_HISTORY_RANGE_DAYS);
+  const historyRangeMeta =
+    HISTORY_OPTIONS.find((option) => option.value === historyRangeDays) ??
+    HISTORY_OPTIONS[1];
 
   const normalizedSearch = search.trim().toLowerCase();
 
@@ -288,11 +468,7 @@ export function PerpTable({
     return rows.filter((row) => matchesSearch(row) && matchesExchange(row));
   }, [normalizedSearch, rows, exchangeFilter]);
 
-  const periodOption =
-    FUNDING_PERIOD_OPTIONS.find((option) => option.value === periodHours) ??
-    FUNDING_PERIOD_OPTIONS[0];
-  const periodLabel = periodOption.label;
-  const fundingColumnLabel = `Hyperliquid 资金费率`;
+  const fundingColumnLabel = "Hyperliquid 1 小时资金费率";
   const hyperliquidSettlementLabel = formatSettlementPeriod(
     DEFAULT_FUNDING_PERIOD_HOURS,
   );
@@ -308,19 +484,52 @@ export function PerpTable({
     setPage(1);
   };
 
-  const handlePeriodChange = (value: string) => {
-    const parsed = Number.parseInt(value, 10);
-
-    if (!Number.isNaN(parsed)) {
-      setPeriodHours(parsed);
-      setPage(1);
-    }
-  };
-
   const handleExchangeFilterChange = (event: ChangeEvent<HTMLInputElement>) => {
     setExchangeFilter(event.target.value as ExchangeFilter);
     setPage(1);
   };
+
+  const handleHistoryClick = useCallback(
+    (row: MarketRow) => {
+      const target = {
+        symbol: row.symbol,
+        displayName: row.displayName ?? row.symbol,
+        binanceSymbol: row.binance?.symbol ?? null,
+      };
+      setHistoryTarget(target);
+      setHistoryError(null);
+      const cacheKey = getHistoryCacheKey(row.symbol, target.binanceSymbol);
+      const cached =
+        historyCacheRef.current[cacheKey]?.[historyRangeDays] ?? null;
+      setHistoryData(cached);
+      setHistoryLoading(!cached);
+      setHistoryDialogOpen(true);
+    },
+    [historyRangeDays],
+  );
+
+  const handleHistoryRangeChange = useCallback(
+    (value: HistoryOptionValue) => {
+      if (value === historyRangeDays) {
+        return;
+      }
+      setHistoryRangeDays(value);
+      if (!historyTarget) {
+        return;
+      }
+      const cacheKey = getHistoryCacheKey(
+        historyTarget.symbol,
+        historyTarget.binanceSymbol,
+      );
+      const cached = historyCacheRef.current[cacheKey]?.[value] ?? null;
+      setHistoryData(cached ?? null);
+      if (historyDialogOpen) {
+        setHistoryError(null);
+        setHistoryLoading(!cached);
+      }
+    },
+    [historyRangeDays, historyTarget, historyDialogOpen],
+  );
 
   const sortedRows = useMemo(() => {
     if (!sortColumn) {
@@ -342,7 +551,7 @@ export function PerpTable({
         {
           const live = liveFunding.hyperliquid[row.symbol];
           const funding = Number.isFinite(live) ? live : row.fundingRate;
-          return funding * periodHours;
+          return funding * displayPeriodHours;
         }
         case "binanceFunding":
         {
@@ -376,10 +585,7 @@ export function PerpTable({
             return Number.NEGATIVE_INFINITY;
           }
 
-          const hyperliquidEightHour =
-            liveHyper * DEFAULT_FUNDING_PERIOD_HOURS;
-          const binanceEightHour = binanceHourly * DEFAULT_FUNDING_PERIOD_HOURS;
-          return Math.abs(hyperliquidEightHour - binanceEightHour);
+          return Math.abs(liveHyper - binanceHourly);
         }
         case "volumeHyperliquid":
           return row.dayNotionalVolume ?? Number.NEGATIVE_INFINITY;
@@ -405,7 +611,7 @@ export function PerpTable({
     });
 
     return rowsWithIndex.map(({ row }) => row);
-  }, [filteredRows, sortColumn, sortDirection, periodHours, liveFunding]);
+  }, [filteredRows, sortColumn, sortDirection, displayPeriodHours, liveFunding]);
 
   const getSortState = (column: SortColumn): "asc" | "desc" | null => {
     if (sortColumn !== column) {
@@ -485,6 +691,64 @@ export function PerpTable({
       .map((row) => row.binance?.symbol)
       .filter((symbol): symbol is string => Boolean(symbol));
   }, [currentRows]);
+
+  useEffect(() => {
+    if (!historyDialogOpen || !historyTarget) {
+      return;
+    }
+
+    const cacheKey = getHistoryCacheKey(
+      historyTarget.symbol,
+      historyTarget.binanceSymbol,
+    );
+    const cached =
+      historyCacheRef.current[cacheKey]?.[historyRangeDays] ?? null;
+    if (cached) {
+      setHistoryData(cached);
+      setHistoryLoading(false);
+      setHistoryError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setHistoryLoading(true);
+    setHistoryError(null);
+
+    fetchFundingHistoryDataset(
+      historyTarget.symbol,
+      historyTarget.binanceSymbol,
+      historyRangeDays,
+    )
+      .then((dataset) => {
+        if (cancelled) {
+          return;
+        }
+        historyCacheRef.current[cacheKey] = {
+          ...(historyCacheRef.current[cacheKey] ?? {}),
+          [historyRangeDays]: dataset,
+        };
+        setHistoryData(dataset);
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        setHistoryError(
+          error instanceof Error
+            ? error.message
+            : "获取资金费率历史失败，请稍后重试。",
+        );
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setHistoryLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [historyDialogOpen, historyTarget, historyRangeDays]);
 
   const showingFrom = sortedLength === 0 ? 0 : startIndex + 1;
   const showingTo = startIndex + currentRows.length;
@@ -605,6 +869,15 @@ export function PerpTable({
     triggerCachedSortRefresh();
   };
 
+  const handleHistoryDialogChange = (open: boolean) => {
+    setHistoryDialogOpen(open);
+    if (!open) {
+      setHistoryTarget(null);
+      setHistoryError(null);
+      setHistoryLoading(false);
+    }
+  };
+
   return (
     <TooltipProvider delayDuration={150}>
       <div className="space-y-4">
@@ -635,32 +908,9 @@ export function PerpTable({
               {isBlockingRefresh ? "刷新中…" : "刷新数据"}
             </Button>
 
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="outline"
-                  className="min-w-[120px] justify-between"
-                >
-                  <span>{periodLabel}</span>
-                  <ChevronDown className="h-4 w-4 opacity-60" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-36">
-                <DropdownMenuRadioGroup
-                  value={String(periodHours)}
-                  onValueChange={handlePeriodChange}
-                >
-                  {FUNDING_PERIOD_OPTIONS.map((option) => (
-                    <DropdownMenuRadioItem
-                      key={option.value}
-                      value={String(option.value)}
-                    >
-                      {option.label}
-                    </DropdownMenuRadioItem>
-                  ))}
-                </DropdownMenuRadioGroup>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <span className="text-xs text-muted-foreground">
+              资金费率均按 1 小时计
+            </span>
 
             <Dialog>
               <DialogTrigger asChild>
@@ -799,7 +1049,7 @@ export function PerpTable({
                     onClick={() => cycleSort("binanceFunding")}
                     className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
                   >
-                    <span>Binance 资金费率</span>
+                    <span>Binance 1 小时资金费率</span>
                     {renderSortIcon("binanceFunding")}
                   </button>
                 </TableHead>
@@ -809,7 +1059,7 @@ export function PerpTable({
                     onClick={() => cycleSort("arbitrage")}
                     className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
                   >
-                    <span>套利空间（8 小时）</span>
+                    <span>套利空间（1 小时）</span>
                     {renderSortIcon("arbitrage")}
                   </button>
                 </TableHead>
@@ -839,13 +1089,16 @@ export function PerpTable({
                     {renderSortIcon("volumeBinance")}
                   </button>
                 </TableHead>
+                <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
+                  资金费率历史
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {currentRows.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={13}
+                    colSpan={14}
                     className="py-12 text-center text-sm text-muted-foreground"
                   >
                     未找到匹配的资产。
@@ -855,9 +1108,10 @@ export function PerpTable({
                 currentRows.map((row) => {
                   const hyperliquidHourly =
                     liveFunding.hyperliquid[row.symbol] ?? row.fundingRate;
-                  const aggregatedFunding = hyperliquidHourly * periodHours;
+                  const aggregatedFunding =
+                    hyperliquidHourly * displayPeriodHours;
                   const hyperEightHourFunding =
-                    hyperliquidHourly * DEFAULT_FUNDING_PERIOD_HOURS;
+                    hyperliquidHourly * ARBITRAGE_COLOR_WINDOW_HOURS;
                   const binanceSettlementLabel = formatSettlementPeriod(
                     row.binance?.fundingPeriodHours ?? null,
                   );
@@ -875,19 +1129,27 @@ export function PerpTable({
                         row.binance.fundingRate ??
                         null
                       : null;
-                const binanceFundingAggregated =
-                  binanceHourly !== null ? binanceHourly * periodHours : null;
-                const binanceEightHourFunding =
-                  binanceHourly !== null
-                    ? binanceHourly * DEFAULT_FUNDING_PERIOD_HOURS
-                    : null;
-                const binanceVolume = row.binance?.volumeUsd ?? null;
-                const arbDelta =
-                  binanceEightHourFunding !== null
-                    ? hyperEightHourFunding - binanceEightHourFunding
-                    : null;
-                const absArbDelta =
-                  arbDelta !== null ? Math.abs(arbDelta) : null;
+                  const binanceFundingAggregated =
+                    binanceHourly !== null
+                      ? binanceHourly * displayPeriodHours
+                      : null;
+                  const binanceEightHourFunding =
+                    binanceHourly !== null
+                      ? binanceHourly * ARBITRAGE_COLOR_WINDOW_HOURS
+                      : null;
+                  const binanceVolume = row.binance?.volumeUsd ?? null;
+                  const hourlyArbDelta =
+                    binanceHourly !== null
+                      ? hyperliquidHourly - binanceHourly
+                      : null;
+                  const absArbDelta =
+                    hourlyArbDelta !== null ? Math.abs(hourlyArbDelta) : null;
+                  const colorArbDelta =
+                    hourlyArbDelta !== null
+                      ? hourlyArbDelta * ARBITRAGE_COLOR_WINDOW_HOURS
+                      : null;
+                  const colorAbsArbDelta =
+                    colorArbDelta !== null ? Math.abs(colorArbDelta) : null;
 
                 let arbitrageBadgeClass =
                   "border-border bg-muted/80 text-muted-foreground";
@@ -896,15 +1158,15 @@ export function PerpTable({
                 let hyperDirLabel = "—";
                 let binanceDirLabel = "—";
                 const isSmallArbitrage =
-                  absArbDelta !== null && absArbDelta < 0.0001;
+                  colorAbsArbDelta !== null && colorAbsArbDelta < 0.0001;
 
-                if (arbDelta !== null) {
-                  if (arbDelta > 0) {
+                if (colorArbDelta !== null) {
+                  if (colorArbDelta > 0) {
                     hyperDirLabel = "做空";
                     hyperDirClass = "text-red-500";
                     binanceDirLabel = "做多";
                     binanceDirClass = "text-emerald-500";
-                  } else if (arbDelta < 0) {
+                  } else if (colorArbDelta < 0) {
                     hyperDirLabel = "做多";
                     hyperDirClass = "text-emerald-500";
                     binanceDirLabel = "做空";
@@ -914,10 +1176,10 @@ export function PerpTable({
                   if (isSmallArbitrage) {
                     arbitrageBadgeClass =
                       "border-border bg-muted/80 text-muted-foreground";
-                  } else if (arbDelta > 0) {
+                  } else if (colorArbDelta > 0) {
                     arbitrageBadgeClass =
                       "border-red-200 bg-red-50 text-red-600";
-                  } else if (arbDelta < 0) {
+                  } else if (colorArbDelta < 0) {
                     arbitrageBadgeClass =
                       "border-emerald-200 bg-emerald-50 text-emerald-600";
                   }
@@ -1089,7 +1351,9 @@ export function PerpTable({
                           </TooltipTrigger>
                           <TooltipContent side="top">
                             <p className="text-[10px] text-muted-foreground">
-                              {isSmallArbitrage ? "套利空间 < 0.01% · " : ""}
+                              {isSmallArbitrage
+                                ? "套利空间（8h） < 0.01% · "
+                                : ""}
                               Hyperliquid{" "}
                               <span className={hyperDirClass}>
                                 {hyperDirLabel}
@@ -1100,7 +1364,8 @@ export function PerpTable({
                               </span>
                             </p>
                             <p className="mt-1 text-[10px] text-muted-foreground">
-                              年化 {computeAnnualizedPercent(absArbDelta)}
+                              年化{" "}
+                              {computeAnnualizedPercent(absArbDelta)}
                             </p>
                           </TooltipContent>
                         </Tooltip>
@@ -1126,6 +1391,24 @@ export function PerpTable({
                   </TableCell>
                   <TableCell className="font-medium">
                     {binanceVolume !== null ? formatVolume(binanceVolume) : "—"}
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    <Tooltip delayDuration={100}>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() => handleHistoryClick(row)}
+                          aria-label="查看资金费率历史"
+                        >
+                          <LineChartIcon className="h-4 w-4" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        查看资金费率历史
+                      </TooltipContent>
+                    </Tooltip>
                   </TableCell>
                 </TableRow>
               );
@@ -1191,6 +1474,106 @@ export function PerpTable({
           </Pagination>
         </div>
       </div>
+      <Dialog open={historyDialogOpen} onOpenChange={handleHistoryDialogChange}>
+        <DialogContent className="w-[96vw] max-w-6xl">
+          <DialogHeader>
+            <DialogTitle>
+              {historyTarget
+                ? `${historyTarget.displayName} 资金费率历史`
+                : "资金费率历史"}
+            </DialogTitle>
+            <DialogDescription>
+              最近 {historyRangeMeta?.label ?? ""} Hyperliquid 与 Binance（若有）
+              的资金费率对比（单位：%）。点击下方时间范围可切换。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-wrap items-center gap-2">
+            {HISTORY_OPTIONS.map((option) => {
+              const isActive = option.value === historyRangeDays;
+              return (
+                <Button
+                  key={option.value}
+                  size="sm"
+                  variant={isActive ? "default" : "outline"}
+                  onClick={() => handleHistoryRangeChange(option.value)}
+                  className={isActive ? "px-3" : "px-3"}
+                >
+                  {option.label}
+                </Button>
+              );
+            })}
+          </div>
+          {historyLoading ? (
+            <div className="flex h-72 items-center justify-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              加载历史数据…
+            </div>
+          ) : historyError ? (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+              {historyError}
+            </div>
+          ) : historyData?.length ? (
+            <div className="h-[480px] w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={historyData} margin={{ top: 12, right: 16, left: 0, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" className="text-muted-foreground/20" />
+                  <XAxis
+                    dataKey="time"
+                    type="number"
+                    tickFormatter={(value) => historyTickFormatter.format(value)}
+                    domain={["auto", "auto"]}
+                    tickMargin={8}
+                    fontSize={12}
+                  />
+                  <YAxis
+                    tickFormatter={(value) => `${value.toFixed(3)}%`}
+                    fontSize={12}
+                    width={60}
+                  />
+                  <RechartsTooltip
+                    formatter={(value: number) => `${value.toFixed(4)}%`}
+                    labelFormatter={(value) =>
+                      historyTooltipFormatter.format(value as number)
+                    }
+                  />
+                  <Legend />
+                  <Line
+                    type="monotone"
+                    dataKey="hyperliquid"
+                    name="Hyperliquid"
+                    stroke="#06b6d4"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="binance"
+                    name="Binance"
+                    stroke="#f97316"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="arbitrage"
+                    name="套利空间（Hyper 空 / Binance 多）"
+                    stroke="#ef4444"
+                    strokeWidth={2}
+                    dot={false}
+                    connectNulls
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <div className="rounded-md border border-border/60 bg-muted/40 px-4 py-6 text-center text-sm text-muted-foreground">
+              暂无历史数据
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </TooltipProvider>
   );
 }

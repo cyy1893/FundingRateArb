@@ -1,3 +1,5 @@
+import { Suspense } from "react";
+
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   Card,
@@ -33,9 +35,15 @@ type AssetContext = {
 
 type MetaAndAssetCtxsResponse = [MetaPayload, AssetContext[]];
 
+type ApiError = {
+  source: string;
+  message: string;
+};
+
 type PerpSnapshot = {
   rows: MarketRow[];
   fetchedAt: Date;
+  errors: ApiError[];
 };
 
 type BinancePerpMetrics = {
@@ -56,7 +64,7 @@ type CoingeckoMarket = {
   price_change_percentage_7d_in_currency?: number | null;
 };
 
-async function getBinancePerpMetrics(): Promise<
+async function getBinancePerpMetrics(apiErrors: ApiError[]): Promise<
   Map<string, BinancePerpMetrics>
 > {
   try {
@@ -177,7 +185,12 @@ async function getBinancePerpMetrics(): Promise<
     });
 
     return combined;
-  } catch {
+  } catch (error) {
+    apiErrors.push({
+      source: "Binance Futures API",
+      message:
+        error instanceof Error ? error.message : "无法获取 Binance 数据。",
+    });
     return new Map();
   }
 }
@@ -199,6 +212,7 @@ type CoinGeckoSnapshot = {
 
 async function getCoinGeckoMarketData(
   symbols: string[],
+  apiErrors: ApiError[],
 ): Promise<Map<string, CoinGeckoSnapshot>> {
   const targetSymbols = new Set(symbols.map((symbol) => symbol.toUpperCase()));
   const markets = new Map<string, CoinGeckoSnapshot>();
@@ -268,7 +282,12 @@ async function getCoinGeckoMarketData(
         break;
       }
     }
-  } catch {
+  } catch (error) {
+    apiErrors.push({
+      source: "CoinGecko API",
+      message:
+        error instanceof Error ? error.message : "无法获取 CoinGecko 数据。",
+    });
     return markets;
   }
 
@@ -276,6 +295,7 @@ async function getCoinGeckoMarketData(
 }
 
 async function getPerpetualSnapshot(): Promise<PerpSnapshot> {
+  const apiErrors: ApiError[] = [];
   const response = await fetch(API_URL, {
     method: "POST",
     headers: {
@@ -304,8 +324,11 @@ async function getPerpetualSnapshot(): Promise<PerpSnapshot> {
   const [meta, contexts] = raw as MetaAndAssetCtxsResponse;
   const fetchedAt = new Date();
   const [binanceMetrics, coingeckoMarkets] = await Promise.all([
-    getBinancePerpMetrics(),
-    getCoinGeckoMarketData(meta.universe.map((asset) => asset.name)),
+    getBinancePerpMetrics(apiErrors),
+    getCoinGeckoMarketData(
+      meta.universe.map((asset) => asset.name),
+      apiErrors,
+    ),
   ]);
 
   const rows: MarketRow[] = [];
@@ -398,12 +421,25 @@ async function getPerpetualSnapshot(): Promise<PerpSnapshot> {
   return {
     rows,
     fetchedAt,
+    errors: apiErrors,
   };
 }
 
 export const revalidate = 0;
 
-export default async function Home() {
+export default function Home() {
+  return (
+    <div className="min-h-screen bg-muted/20 py-10">
+      <div className="container mx-auto flex max-w-[1500px] flex-col gap-6 px-4">
+        <Suspense fallback={<DashboardSkeleton />}>
+          <DashboardContent />
+        </Suspense>
+      </div>
+    </div>
+  );
+}
+
+async function DashboardContent() {
   let snapshot: PerpSnapshot | null = null;
   let errorMessage: string | null = null;
 
@@ -418,6 +454,7 @@ export default async function Home() {
 
   const rows = snapshot?.rows ?? [];
   const fetchedAt = snapshot?.fetchedAt ?? new Date();
+  const apiErrors = snapshot?.errors ?? [];
   const settlementPeriodHours = 1;
   const nextSettlementIso = computeNextSettlementTimestamp(
     fetchedAt,
@@ -425,52 +462,97 @@ export default async function Home() {
   );
 
   return (
-    <div className="min-h-screen bg-muted/20 py-10">
-      <div className="container mx-auto flex max-w-[1500px] flex-col gap-6 px-4">
-        <Card className="border-border/60">
-          <CardHeader className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-            <div className="space-y-2">
-              <CardTitle className="text-2xl font-semibold tracking-tight">
-                Hyperliquid 永续合约总览
-              </CardTitle>
-              <CardDescription className="max-w-2xl text-sm text-muted-foreground">
-                极简 toB 面板展示 Hyperliquid 交易所永续合约的核心指标。数据实时获取自
-                Hyperliquid Info API。
-              </CardDescription>
-            </div>
-            <div className="rounded-lg border border-border/70 bg-muted/40 px-4 py-3 text-sm">
-              <div className="flex flex-col gap-3 text-muted-foreground">
-                <div className="flex items-center justify-between gap-8">
-                  <div className="flex flex-col gap-1">
-                    <span className="uppercase tracking-wide text-xs">
-                      资金结算（整点）
-                    </span>
-                    <SettlementCountdown
-                      targetIso={nextSettlementIso}
-                      className="text-lg"
-                    />
-                  </div>
-                </div>
+    <Card className="border-border/60">
+      <CardHeader className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+        <div className="space-y-2">
+          <CardTitle className="text-2xl font-semibold tracking-tight">
+            Hyperliquid 永续合约总览
+          </CardTitle>
+          <CardDescription className="max-w-2xl text-sm text-muted-foreground">
+            极简 toB 面板展示 Hyperliquid 交易所永续合约的核心指标。数据实时获取自
+            Hyperliquid Info API。
+          </CardDescription>
+        </div>
+        <div className="rounded-lg border border-border/70 bg-muted/40 px-4 py-3 text-sm">
+          <div className="flex flex-col gap-3 text-muted-foreground">
+            <div className="flex items-center justify-between gap-8">
+              <div className="flex flex-col gap-1">
+                <span className="uppercase tracking-wide text-xs">
+                  资金结算（整点）
+                </span>
+                <SettlementCountdown
+                  targetIso={nextSettlementIso}
+                  className="text-lg"
+                />
               </div>
             </div>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {errorMessage ? (
-              <Alert variant="destructive">
-                <AlertTitle>数据获取失败</AlertTitle>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {errorMessage ? (
+          <Alert variant="destructive">
+            <AlertTitle>数据获取失败</AlertTitle>
+            <AlertDescription>
+              请求失败：{errorMessage}，请稍后重试。
+            </AlertDescription>
+          </Alert>
+        ) : (
+          <>
+            {apiErrors.length > 0 ? (
+              <Alert variant="default">
+                <AlertTitle>部分数据来源不可用</AlertTitle>
                 <AlertDescription>
-                  请求失败：{errorMessage}，请稍后重试。
+                  <ul className="mt-2 list-disc space-y-1 pl-4 text-xs">
+                    {apiErrors.map((apiError, index) => (
+                      <li key={`${apiError.source}-${index}`}>
+                        <span className="font-semibold">
+                          {apiError.source}:
+                        </span>{" "}
+                        <span>{apiError.message}</span>
+                      </li>
+                    ))}
+                  </ul>
                 </AlertDescription>
               </Alert>
-            ) : (
-              <PerpTable
-                rows={rows}
-                defaultPeriodHours={DEFAULT_FUNDING_PERIOD_HOURS}
-              />
-            )}
-          </CardContent>
-        </Card>
-      </div>
-    </div>
+            ) : null}
+            <PerpTable rows={rows} />
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function DashboardSkeleton() {
+  return (
+    <Card className="border-border/60">
+      <CardHeader className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+        <div className="w-full space-y-2 animate-pulse">
+          <div className="h-6 w-48 rounded bg-muted" />
+          <div className="h-4 w-64 rounded bg-muted/80" />
+        </div>
+        <div className="rounded-lg border border-border/70 bg-muted/40 px-4 py-3 text-sm">
+          <div className="flex flex-col gap-3 text-muted-foreground">
+            <div className="flex items-center justify-between gap-8">
+              <div className="flex flex-col gap-2">
+                <span className="h-3 w-24 rounded bg-muted/80" />
+                <span className="h-6 w-32 rounded bg-muted" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-3">
+          <div className="h-4 w-40 rounded bg-muted/70" />
+          <div className="h-11 rounded-lg bg-muted/60" />
+          <div className="h-8 rounded bg-muted/40" />
+        </div>
+        <div className="rounded-xl border border-dashed border-border/70">
+          <div className="h-[520px] w-full animate-pulse rounded-xl bg-muted/40" />
+        </div>
+      </CardContent>
+    </Card>
   );
 }
