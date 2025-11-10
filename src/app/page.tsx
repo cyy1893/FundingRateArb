@@ -424,17 +424,9 @@ export default async function Home() {
     settlementPeriodHours,
   );
 
-  const lastUpdated = new Intl.DateTimeFormat("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-    timeZoneName: "short",
-  }).format(fetchedAt);
-
   return (
     <div className="min-h-screen bg-muted/20 py-10">
-      <div className="container mx-auto flex max-w-7xl flex-col gap-6 px-4">
+      <div className="container mx-auto flex max-w-[1500px] flex-col gap-6 px-4">
         <Card className="border-border/60">
           <CardHeader className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
             <div className="space-y-2">
@@ -458,10 +450,6 @@ export default async function Home() {
                       className="text-lg"
                     />
                   </div>
-                </div>
-                <div className="flex flex-col gap-1 text-xs">
-                  <span className="uppercase tracking-wide">最近更新</span>
-                  <span className="font-medium text-foreground">{lastUpdated}</span>
                 </div>
               </div>
             </div>

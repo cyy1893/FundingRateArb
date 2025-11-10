@@ -82,7 +82,7 @@ type PerpTableProps = {
   defaultPeriodHours?: number;
 };
 
-const DEFAULT_PAGE_SIZE = 25;
+const DEFAULT_PAGE_SIZE = 15;
 const FETCH_INTERVAL_MS = 15000;
 const SORT_REFRESH_CACHE_MS = 5000;
 
@@ -243,6 +243,18 @@ function getFundingBadgeClass(rate: number): string {
   return "border-[#6ee7b7] bg-[#6ee7b71a] text-[#047857]";
 }
 
+function formatSettlementPeriod(hours: number | null | undefined): string {
+  if (typeof hours !== "number" || !Number.isFinite(hours) || hours <= 0) {
+    return "—";
+  }
+
+  const label = Number.isInteger(hours)
+    ? hours.toString()
+    : hours.toFixed(2).replace(/\.?0+$/, "");
+
+  return `${label} 小时`;
+}
+
 export function PerpTable({
   rows,
   pageSize = DEFAULT_PAGE_SIZE,
@@ -262,7 +274,6 @@ export function PerpTable({
     hyperliquid: {},
     binance: {},
   });
-  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [isBlockingRefresh, setIsBlockingRefresh] = useState(false);
 
   const normalizedSearch = search.trim().toLowerCase();
@@ -282,6 +293,9 @@ export function PerpTable({
     FUNDING_PERIOD_OPTIONS[0];
   const periodLabel = periodOption.label;
   const fundingColumnLabel = `Hyperliquid 资金费率`;
+  const hyperliquidSettlementLabel = formatSettlementPeriod(
+    DEFAULT_FUNDING_PERIOD_HOURS,
+  );
 
   const handlePageChange = (nextPage: number) => {
     if (nextPage >= 1 && nextPage <= pageCount) {
@@ -547,7 +561,6 @@ export function PerpTable({
           hyperliquid: hyperRates,
           binance: binanceRates,
         });
-        setLastRefresh(new Date());
         lastFetchRef.current = Date.now();
       } catch {
         // ignore network errors; keep last values
@@ -724,25 +737,6 @@ export function PerpTable({
               任一存在
             </label>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="font-medium text-foreground">当前资金周期：</span>
-            <Badge variant="secondary" className="bg-muted/70">
-              {periodLabel}
-            </Badge>
-          </div>
-          <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-muted-foreground">
-            <span>最近更新</span>
-            <span className="font-medium text-foreground tabular-nums">
-              {lastRefresh
-                ? lastRefresh.toLocaleTimeString("en-US", {
-                    hour12: false,
-                    hour: "2-digit",
-                    minute: "2-digit",
-                    second: "2-digit",
-                  })
-                : "—"}
-            </span>
-          </div>
         </div>
 
         <div className="relative rounded-xl border">
@@ -799,26 +793,32 @@ export function PerpTable({
                     {renderSortIcon("funding")}
                   </button>
                 </TableHead>
-              <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
-                <button
-                  type="button"
-                  onClick={() => cycleSort("binanceFunding")}
-                  className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
-                >
-                  <span>Binance 资金费率</span>
-                  {renderSortIcon("binanceFunding")}
-                </button>
-              </TableHead>
-              <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
-                <button
-                  type="button"
-                  onClick={() => cycleSort("arbitrage")}
-                  className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
-                >
-                  <span>套利空间（8 小时）</span>
-                  {renderSortIcon("arbitrage")}
-                </button>
-              </TableHead>
+                <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
+                  <button
+                    type="button"
+                    onClick={() => cycleSort("binanceFunding")}
+                    className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
+                  >
+                    <span>Binance 资金费率</span>
+                    {renderSortIcon("binanceFunding")}
+                  </button>
+                </TableHead>
+                <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
+                  <button
+                    type="button"
+                    onClick={() => cycleSort("arbitrage")}
+                    className="inline-flex w-full items-center justify-between gap-1 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:text-primary focus:outline-none"
+                  >
+                    <span>套利空间（8 小时）</span>
+                    {renderSortIcon("arbitrage")}
+                  </button>
+                </TableHead>
+                <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
+                  Hyperliquid 结算周期
+                </TableHead>
+                <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
+                  Binance 结算周期
+                </TableHead>
                 <TableHead className="text-left font-semibold text-[11px] text-muted-foreground">
                   <button
                     type="button"
@@ -845,7 +845,7 @@ export function PerpTable({
               {currentRows.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={11}
+                    colSpan={13}
                     className="py-12 text-center text-sm text-muted-foreground"
                   >
                     未找到匹配的资产。
@@ -858,6 +858,9 @@ export function PerpTable({
                   const aggregatedFunding = hyperliquidHourly * periodHours;
                   const hyperEightHourFunding =
                     hyperliquidHourly * DEFAULT_FUNDING_PERIOD_HOURS;
+                  const binanceSettlementLabel = formatSettlementPeriod(
+                    row.binance?.fundingPeriodHours ?? null,
+                  );
                   const marketUrl = `https://app.hyperliquid.xyz/trade/${encodeURIComponent(
                     row.symbol,
                   )}`;
@@ -999,10 +1002,40 @@ export function PerpTable({
                       {row.maxLeverage}倍
                     </TableCell>
                     <TableCell>
+                      <Tooltip delayDuration={100}>
+                        <TooltipTrigger asChild>
+                          <a
+                            href={marketUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex"
+                          >
+                            <Badge
+                              variant="secondary"
+                              className={cn(
+                                "font-medium text-xs",
+                                getFundingBadgeClass(hyperEightHourFunding),
+                              )}
+                            >
+                              {formatFundingRate(aggregatedFunding)}
+                            </Badge>
+                          </a>
+                        </TooltipTrigger>
+                        <TooltipContent side="top">
+                          <p>{describeFundingDirection(aggregatedFunding)}</p>
+                          <p className="mt-1 text-[10px] text-muted-foreground">
+                            {formatAnnualizedFunding(hyperliquidHourly)}
+                          </p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TableCell>
+                    <TableCell>
+                      {binanceFundingAggregated !== null &&
+                      row.binance?.symbol ? (
                         <Tooltip delayDuration={100}>
                           <TooltipTrigger asChild>
                             <a
-                              href={marketUrl}
+                              href={`https://www.binance.com/zh-CN/futures/${row.binance.symbol}`}
                               target="_blank"
                               rel="noreferrer"
                               className="inline-flex"
@@ -1011,102 +1044,81 @@ export function PerpTable({
                                 variant="secondary"
                                 className={cn(
                                   "font-medium text-xs",
-                                  getFundingBadgeClass(hyperEightHourFunding),
+                                  getFundingBadgeClass(
+                                    binanceEightHourFunding ?? 0,
+                                  ),
                                 )}
                               >
-                                {formatFundingRate(aggregatedFunding)}
+                                {formatFundingRate(binanceFundingAggregated)}
                               </Badge>
                             </a>
                           </TooltipTrigger>
                           <TooltipContent side="top">
-                            <p>{describeFundingDirection(aggregatedFunding)}</p>
+                            <p>
+                              {describeFundingDirection(
+                                binanceFundingAggregated,
+                              )}
+                            </p>
                             <p className="mt-1 text-[10px] text-muted-foreground">
-                              {formatAnnualizedFunding(hyperliquidHourly)}
+                              {formatAnnualizedFunding(binanceHourly ?? 0)}
                             </p>
                           </TooltipContent>
                         </Tooltip>
-                      </TableCell>
-                      <TableCell>
-                        {binanceFundingAggregated !== null &&
-                        row.binance?.symbol ? (
-                          <Tooltip delayDuration={100}>
-                            <TooltipTrigger asChild>
-                              <a
-                                href={`https://www.binance.com/zh-CN/futures/${row.binance.symbol}`}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex"
-                              >
-                                <Badge
-                                  variant="secondary"
-                                  className={cn(
-                                    "font-medium text-xs",
-                                    getFundingBadgeClass(
-                                      binanceEightHourFunding ?? 0,
-                                    ),
-                                  )}
-                                >
-                                  {formatFundingRate(binanceFundingAggregated)}
-                                </Badge>
-                              </a>
-                            </TooltipTrigger>
-                            <TooltipContent side="top">
-                              <p>
-                                {describeFundingDirection(
-                                  binanceFundingAggregated,
-                                )}
-                              </p>
-                              <p className="mt-1 text-[10px] text-muted-foreground">
-                                {formatAnnualizedFunding(binanceHourly ?? 0)}
-                              </p>
-                            </TooltipContent>
-                          </Tooltip>
-                        ) : (
-                          <Badge
-                            variant="secondary"
-                            className="font-medium text-xs border-border bg-muted/80 text-muted-foreground"
-                          >
-                            —
-                          </Badge>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {absArbDelta !== null ? (
-                      <Tooltip delayDuration={100}>
-                        <TooltipTrigger asChild>
-                          <Badge
-                            variant="secondary"
-                            className={cn("font-medium text-xs", arbitrageBadgeClass)}
-                          >
-                            {formatFundingRate(absArbDelta)}
-                          </Badge>
-                        </TooltipTrigger>
-                        <TooltipContent side="top">
-                          <p className="text-[10px] text-muted-foreground">
-                            {isSmallArbitrage ? "套利空间 < 0.01% · " : ""}
-                            Hyperliquid{" "}
-                            <span className={hyperDirClass}>
-                              {hyperDirLabel}
-                            </span>{" "}
-                            · Binance{" "}
-                            <span className={binanceDirClass}>
-                              {binanceDirLabel}
-                            </span>
-                          </p>
-                          <p className="mt-1 text-[10px] text-muted-foreground">
-                            年化 {computeAnnualizedPercent(absArbDelta)}
-                          </p>
-                        </TooltipContent>
-                      </Tooltip>
-                    ) : (
-                      <Badge
-                        variant="secondary"
-                        className="font-medium text-xs border-border bg-muted/80 text-muted-foreground"
-                          >
-                            —
-                          </Badge>
-                        )}
-                      </TableCell>
+                      ) : (
+                        <Badge
+                          variant="secondary"
+                          className="font-medium text-xs border-border bg-muted/80 text-muted-foreground"
+                        >
+                          —
+                        </Badge>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {absArbDelta !== null ? (
+                        <Tooltip delayDuration={100}>
+                          <TooltipTrigger asChild>
+                            <Badge
+                              variant="secondary"
+                              className={cn(
+                                "font-medium text-xs",
+                                arbitrageBadgeClass,
+                              )}
+                            >
+                              {formatFundingRate(absArbDelta)}
+                            </Badge>
+                          </TooltipTrigger>
+                          <TooltipContent side="top">
+                            <p className="text-[10px] text-muted-foreground">
+                              {isSmallArbitrage ? "套利空间 < 0.01% · " : ""}
+                              Hyperliquid{" "}
+                              <span className={hyperDirClass}>
+                                {hyperDirLabel}
+                              </span>{" "}
+                              · Binance{" "}
+                              <span className={binanceDirClass}>
+                                {binanceDirLabel}
+                              </span>
+                            </p>
+                            <p className="mt-1 text-[10px] text-muted-foreground">
+                              年化 {computeAnnualizedPercent(absArbDelta)}
+                            </p>
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : (
+                        <Badge
+                          variant="secondary"
+                          className="font-medium text-xs border-border bg-muted/80 text-muted-foreground"
+                        >
+                          —
+                        </Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-xs font-medium text-muted-foreground whitespace-nowrap">
+                      {hyperliquidSettlementLabel}
+                    </TableCell>
+                    <TableCell className="text-xs font-medium text-muted-foreground whitespace-nowrap">
+                      {binanceSettlementLabel}
+                    </TableCell>
                   <TableCell className="font-medium">
                     {row.dayNotionalVolume !== null
                       ? formatVolume(row.dayNotionalVolume)
