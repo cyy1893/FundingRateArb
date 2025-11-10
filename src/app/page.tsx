@@ -430,7 +430,7 @@ export const revalidate = 0;
 export default function Home() {
   return (
     <div className="min-h-screen bg-muted/20 py-10">
-      <div className="container mx-auto flex max-w-[1500px] flex-col gap-6 px-4">
+      <div className="container mx-auto flex max-w-[1900px] flex-col gap-6 px-4">
         <Suspense fallback={<DashboardSkeleton />}>
           <DashboardContent />
         </Suspense>

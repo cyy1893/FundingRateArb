@@ -1,7 +1,5 @@
 "use client";
 
-/* eslint-disable @next/next/no-img-element */
-
 import {
   ChangeEvent,
   WheelEvent,
@@ -24,12 +22,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   Pagination,
   PaginationContent,
@@ -65,7 +58,6 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import type { BrushChangeState } from "recharts/types/component/Brush";
 
 type PerpTableProps = {
   rows: MarketRow[];
@@ -110,6 +102,11 @@ const HISTORY_OPTIONS = [
   { label: "1 周", value: 7 },
   { label: "1 月", value: 30 },
 ] as const;
+
+type BrushRange = {
+  startIndex?: number;
+  endIndex?: number;
+};
 type HistoryOptionValue = (typeof HISTORY_OPTIONS)[number]["value"];
 
 const DEFAULT_HISTORY_RANGE_DAYS: HistoryOptionValue = 7;
@@ -716,7 +713,7 @@ export function PerpTable({
     [historyTimeBounds],
   );
   const handleHistoryBrushChange = useCallback(
-    (range?: BrushChangeState) => {
+    (range?: BrushRange) => {
       if (!historyData?.length || !historyTimeBounds || !range) {
         return;
       }
