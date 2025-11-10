@@ -14,6 +14,20 @@ export const FUNDING_PERIOD_OPTIONS: FundingPeriodOption[] = [
 ];
 
 export const MS_PER_HOUR = 60 * 60 * 1000;
+
+export function formatSettlementPeriod(
+  hours: number | null | undefined,
+): string {
+  if (typeof hours !== "number" || !Number.isFinite(hours) || hours <= 0) {
+    return "—";
+  }
+
+  const label = Number.isInteger(hours)
+    ? hours.toString()
+    : hours.toFixed(2).replace(/\.?0+$/, "");
+
+  return `${label} 小时`;
+}
 export const MS_PER_MINUTE = 60 * 1000;
 
 export function computeNextSettlementTimestamp(

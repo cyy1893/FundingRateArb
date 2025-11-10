@@ -4,23 +4,16 @@
 
 import {
   ChangeEvent,
+  WheelEvent,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import {
-  ArrowDownRight,
-  ArrowUpRight,
-  ChevronDown,
-  ChevronUp,
-  LineChart as LineChartIcon,
-  Loader2,
-  Minus,
-} from "lucide-react";
+import { ChevronDown, ChevronUp, Loader2 } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
+import { PerpTableRow } from "@/components/perp-table-row";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -54,28 +47,25 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { DEFAULT_FUNDING_PERIOD_HOURS } from "@/lib/funding";
-import { cn } from "@/lib/utils";
 import {
-  formatFundingRate,
-  formatPrice,
-  formatVolume,
-  describeFundingDirection,
-  formatAnnualizedFunding,
-  computeAnnualizedPercent,
-  formatPercentChange,
-} from "@/lib/formatters";
+  DEFAULT_FUNDING_PERIOD_HOURS,
+  formatSettlementPeriod,
+} from "@/lib/funding";
+import { cn } from "@/lib/utils";
 import type { MarketRow } from "@/types/market";
 import {
+  Brush,
   CartesianGrid,
   Legend,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip as RechartsTooltip,
   XAxis,
   YAxis,
 } from "recharts";
+import type { BrushChangeState } from "recharts/types/component/Brush";
 
 type PerpTableProps = {
   rows: MarketRow[];
@@ -124,7 +114,13 @@ type HistoryOptionValue = (typeof HISTORY_OPTIONS)[number]["value"];
 
 const DEFAULT_HISTORY_RANGE_DAYS: HistoryOptionValue = 7;
 const MS_PER_HOUR = 60 * 60 * 1000;
-const ARBITRAGE_COLOR_WINDOW_HOURS = 8;
+const DEFAULT_BINANCE_FUNDING_PERIOD_HOURS = 8;
+const MAX_HYPER_FUNDING_POINTS = 500;
+const MAX_HYPER_LOOKBACK_MS = MAX_HYPER_FUNDING_POINTS * MS_PER_HOUR;
+const HOURS_PER_YEAR = 24 * 365;
+const MIN_HISTORY_WINDOW_MS = 3 * MS_PER_HOUR;
+const HISTORY_PAN_SENSITIVITY = 900;
+const HISTORY_WHEEL_ZOOM_STEP = 0.18;
 
 const historyTickFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
@@ -138,6 +134,121 @@ const historyTooltipFormatter = new Intl.DateTimeFormat("zh-CN", {
   hour: "2-digit",
   minute: "2-digit",
 });
+const historyPercentFormatter = new Intl.NumberFormat("en-US", {
+  minimumSignificantDigits: 2,
+  maximumSignificantDigits: 5,
+  useGrouping: false,
+});
+
+function formatHistoryPercentValue(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+  return historyPercentFormatter.format(value);
+}
+
+function formatAnnualizedPercentFromHourly(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+  const annualized = Math.abs(value) * HOURS_PER_YEAR;
+  return formatHistoryPercentValue(annualized);
+}
+
+function formatHistoryTooltipValue(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+  const hourly = formatHistoryPercentValue(value);
+  const annualized = formatAnnualizedPercentFromHourly(value);
+  return `${hourly}% · 年化 ${annualized}%`;
+}
+
+function clampHistoryDomain(
+  domain: [number, number],
+  bounds: [number, number],
+): [number, number] {
+  const [minBound, maxBound] = bounds;
+  if (!Number.isFinite(minBound) || !Number.isFinite(maxBound)) {
+    return domain;
+  }
+
+  const totalSpan = Math.max(maxBound - minBound, 0);
+  if (totalSpan === 0) {
+    return [minBound, maxBound];
+  }
+
+  const [start, end] = domain[0] <= domain[1] ? domain : [domain[1], domain[0]];
+  const minWindow = Math.min(MIN_HISTORY_WINDOW_MS, totalSpan);
+  const requestedSpan = Math.max(end - start, minWindow);
+
+  if (requestedSpan >= totalSpan) {
+    return [minBound, maxBound];
+  }
+
+  let clampedStart = Math.min(
+    Math.max(start, minBound),
+    maxBound - requestedSpan,
+  );
+  let clampedEnd = clampedStart + requestedSpan;
+
+  if (clampedEnd > maxBound) {
+    clampedEnd = maxBound;
+    clampedStart = clampedEnd - requestedSpan;
+  }
+
+  return [clampedStart, clampedEnd];
+}
+
+function findNearestIndexByTime(
+  data: FundingHistoryPoint[],
+  target: number,
+  mode: "floor" | "ceil",
+): number {
+  if (data.length === 0) {
+    return 0;
+  }
+
+  if (mode === "floor" && target <= data[0].time) {
+    return 0;
+  }
+  if (mode === "ceil" && target <= data[0].time) {
+    return 0;
+  }
+  if (mode === "ceil" && target >= data[data.length - 1].time) {
+    return data.length - 1;
+  }
+  if (mode === "floor" && target >= data[data.length - 1].time) {
+    return data.length - 1;
+  }
+
+  let low = 0;
+  let high = data.length - 1;
+  let result = mode === "floor" ? 0 : data.length - 1;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const midTime = data[mid].time;
+
+    if (midTime === target) {
+      return mid;
+    }
+
+    if (midTime < target) {
+      low = mid + 1;
+      if (mode === "floor") {
+        result = mid;
+      }
+    } else {
+      high = mid - 1;
+      if (mode === "ceil") {
+        result = mid;
+      }
+    }
+  }
+
+  return result;
+}
 
 async function fetchHyperliquidFundingRates(
   symbols: string[],
@@ -338,8 +449,12 @@ async function fetchFundingHistoryDataset(
   symbol: string,
   binanceSymbol: string | null,
   days: number,
+  binanceFundingPeriodHours: number | null,
 ): Promise<FundingHistoryPoint[]> {
-  const startTime = Date.now() - days * 24 * MS_PER_HOUR;
+  const now = Date.now();
+  const desiredStart = now - days * 24 * MS_PER_HOUR;
+  const latestAllowedStart = now - MAX_HYPER_LOOKBACK_MS;
+  const startTime = Math.max(desiredStart, latestAllowedStart);
   const [hyperHistory, binanceHistory] = await Promise.all([
     fetchHyperliquidFundingHistorySeries(symbol, startTime).catch(() => []),
     binanceSymbol
@@ -353,68 +468,65 @@ async function fetchFundingHistoryDataset(
     throw new Error("暂无可用的资金费率历史数据");
   }
 
-  const merged = new Map<number, FundingHistoryPoint>();
+  const sortedHyper = [...hyperHistory].sort((a, b) => a.time - b.time);
+  const sortedBinance = [...binanceHistory].sort((a, b) => a.time - b.time);
+  const intervalHours = Math.max(
+    binanceFundingPeriodHours ?? DEFAULT_BINANCE_FUNDING_PERIOD_HOURS,
+    1,
+  );
 
-  hyperHistory.forEach(({ time, rate }) => {
-    const existing = merged.get(time) ?? { time };
-    existing.hyperliquid = rate * 100;
-    merged.set(time, existing);
-  });
+  if (sortedHyper.length === 0) {
+    return sortedBinance
+      .map(({ time, rate }) => ({
+        time,
+        hyperliquid: null,
+        binance: (rate / intervalHours) * 100,
+        arbitrage: null,
+      }))
+      .sort((a, b) => a.time - b.time);
+  }
 
-  binanceHistory.forEach(({ time, rate }) => {
-    const existing = merged.get(time) ?? { time };
-    existing.binance =
-      (rate / Math.max(DEFAULT_FUNDING_PERIOD_HOURS, 1)) * 100;
-    merged.set(time, existing);
-  });
+  const dataset: FundingHistoryPoint[] = [];
+  let binanceIndex = 0;
+  let currentBinanceHourly: number | null = null;
 
-  const dataset = Array.from(merged.values()).map((entry) => {
-    if (
-      typeof entry.hyperliquid === "number" &&
-      typeof entry.binance === "number"
+  sortedHyper.forEach(({ time, rate }) => {
+    while (
+      binanceIndex < sortedBinance.length &&
+      sortedBinance[binanceIndex].time <= time
     ) {
-      entry.arbitrage = entry.binance - entry.hyperliquid;
-    } else {
-      entry.arbitrage = null;
+      const hourly = (sortedBinance[binanceIndex].rate / intervalHours) * 100;
+      if (Number.isFinite(hourly)) {
+        currentBinanceHourly = hourly;
+      }
+      binanceIndex += 1;
     }
 
-    return entry;
+    const hyperValue = rate * 100;
+    const binanceValue = currentBinanceHourly;
+
+    dataset.push({
+      time,
+      hyperliquid: hyperValue,
+      binance: binanceValue,
+      arbitrage:
+        typeof binanceValue === "number"
+          ? binanceValue - hyperValue
+          : null,
+    });
   });
 
-  return dataset.sort((a, b) => a.time - b.time);
+  return dataset;
 }
 
-const RATE_THRESHOLDS = {
-  negative: 0,
-  neutralUpperBound: 0.0001,
-} as const;
-
-function getFundingBadgeClass(rate: number): string {
-  if (rate < RATE_THRESHOLDS.negative) {
-    return "border-[#fb7185]/60 bg-[#f87171]/10 text-[#b91c1c]";
-  }
-
-  if (rate <= RATE_THRESHOLDS.neutralUpperBound) {
-    return "border-[#cbd5f5] bg-[#cbd5f51a] text-[#475569]";
-  }
-
-  return "border-[#6ee7b7] bg-[#6ee7b71a] text-[#047857]";
-}
-
-function formatSettlementPeriod(hours: number | null | undefined): string {
-  if (typeof hours !== "number" || !Number.isFinite(hours) || hours <= 0) {
-    return "—";
-  }
-
-  const label = Number.isInteger(hours)
-    ? hours.toString()
-    : hours.toFixed(2).replace(/\.?0+$/, "");
-
-  return `${label} 小时`;
-}
-
-function getHistoryCacheKey(symbol: string, binanceSymbol: string | null) {
-  return `${symbol}__${binanceSymbol ?? "none"}`;
+function getHistoryCacheKey(
+  symbol: string,
+  binanceSymbol: string | null,
+  binanceFundingPeriodHours: number | null,
+) {
+  return `${symbol}__${binanceSymbol ?? "none"}__${
+    binanceFundingPeriodHours ?? "default"
+  }`;
 }
 
 export function PerpTable({
@@ -440,6 +552,7 @@ export function PerpTable({
     symbol: string;
     displayName: string;
     binanceSymbol: string | null;
+    binanceFundingPeriodHours: number | null;
   } | null>(null);
   const [historyData, setHistoryData] = useState<FundingHistoryPoint[] | null>(
     null,
@@ -449,12 +562,67 @@ export function PerpTable({
   const historyCacheRef = useRef<
     Record<string, Record<number, FundingHistoryPoint[]>>
   >({});
+  const historyChartWrapperRef = useRef<HTMLDivElement | null>(null);
   const displayPeriodHours = DISPLAY_FUNDING_PERIOD_HOURS;
   const [historyRangeDays, setHistoryRangeDays] =
     useState<HistoryOptionValue>(DEFAULT_HISTORY_RANGE_DAYS);
   const historyRangeMeta =
     HISTORY_OPTIONS.find((option) => option.value === historyRangeDays) ??
     HISTORY_OPTIONS[1];
+  const historyRangeDurationMs = historyRangeDays * 24 * MS_PER_HOUR;
+  const [historyViewport, setHistoryViewport] = useState<[number, number] | null>(
+    null,
+  );
+  const historyDataSignature = useMemo(() => {
+    if (!historyData?.length) {
+      return "empty";
+    }
+    const first = historyData[0]?.time ?? 0;
+    const last = historyData[historyData.length - 1]?.time ?? 0;
+    return `${historyData.length}-${first}-${last}`;
+  }, [historyData]);
+  useEffect(() => {
+    setHistoryViewport(null);
+  }, [historyDataSignature, historyRangeDays]);
+  const historyTimeBounds = useMemo<[number, number] | null>(() => {
+    if (!historyData?.length) {
+      return null;
+    }
+    const first = historyData[0].time;
+    const last = historyData[historyData.length - 1].time;
+    if (!Number.isFinite(first) || !Number.isFinite(last)) {
+      return null;
+    }
+    return [first, last];
+  }, [historyData]);
+  const historyDefaultDomain = useMemo<[number, number] | null>(() => {
+    if (!historyTimeBounds) {
+      return null;
+    }
+    const [minTime, maxTime] = historyTimeBounds;
+    const availableSpan = Math.max(maxTime - minTime, 0);
+    if (availableSpan === 0) {
+      return [minTime, maxTime];
+    }
+    const desiredSpan = Math.min(historyRangeDurationMs, availableSpan);
+    const span = desiredSpan > 0 ? desiredSpan : availableSpan;
+    const start = Math.max(minTime, maxTime - span);
+    return [start, maxTime];
+  }, [historyTimeBounds, historyRangeDurationMs]);
+  const historyXAxisDomain = historyViewport ?? historyDefaultDomain ?? null;
+  const historyBrushState = useMemo(() => {
+    if (!historyData?.length) {
+      return null;
+    }
+    if (!historyXAxisDomain) {
+      return { startIndex: 0, endIndex: historyData.length - 1 };
+    }
+    const [domainStart, domainEnd] = historyXAxisDomain;
+    return {
+      startIndex: findNearestIndexByTime(historyData, domainStart, "floor"),
+      endIndex: findNearestIndexByTime(historyData, domainEnd, "ceil"),
+    };
+  }, [historyData, historyXAxisDomain]);
 
   const normalizedSearch = search.trim().toLowerCase();
 
@@ -495,10 +663,15 @@ export function PerpTable({
         symbol: row.symbol,
         displayName: row.displayName ?? row.symbol,
         binanceSymbol: row.binance?.symbol ?? null,
+        binanceFundingPeriodHours: row.binance?.fundingPeriodHours ?? null,
       };
       setHistoryTarget(target);
       setHistoryError(null);
-      const cacheKey = getHistoryCacheKey(row.symbol, target.binanceSymbol);
+      const cacheKey = getHistoryCacheKey(
+        row.symbol,
+        target.binanceSymbol,
+        target.binanceFundingPeriodHours,
+      );
       const cached =
         historyCacheRef.current[cacheKey]?.[historyRangeDays] ?? null;
       setHistoryData(cached);
@@ -520,6 +693,7 @@ export function PerpTable({
       const cacheKey = getHistoryCacheKey(
         historyTarget.symbol,
         historyTarget.binanceSymbol,
+        historyTarget.binanceFundingPeriodHours,
       );
       const cached = historyCacheRef.current[cacheKey]?.[value] ?? null;
       setHistoryData(cached ?? null);
@@ -529,6 +703,154 @@ export function PerpTable({
       }
     },
     [historyRangeDays, historyTarget, historyDialogOpen],
+  );
+  const historyInteractionsDisabled = !historyData?.length || !historyTimeBounds;
+  const updateHistoryViewport = useCallback(
+    (nextDomain: [number, number]) => {
+      if (!historyTimeBounds) {
+        setHistoryViewport(nextDomain);
+        return;
+      }
+      setHistoryViewport(clampHistoryDomain(nextDomain, historyTimeBounds));
+    },
+    [historyTimeBounds],
+  );
+  const handleHistoryBrushChange = useCallback(
+    (range?: BrushChangeState) => {
+      if (!historyData?.length || !historyTimeBounds || !range) {
+        return;
+      }
+      const startIndex = Math.max(
+        0,
+        Math.min(range.startIndex ?? 0, historyData.length - 1),
+      );
+      const endIndex = Math.max(
+        0,
+        Math.min(range.endIndex ?? historyData.length - 1, historyData.length - 1),
+      );
+      if (startIndex === endIndex) {
+        return;
+      }
+      const low = Math.min(startIndex, endIndex);
+      const high = Math.max(startIndex, endIndex);
+      const nextDomain: [number, number] = [
+        historyData[low].time,
+        historyData[high].time,
+      ];
+      updateHistoryViewport(nextDomain);
+    },
+    [historyData, historyTimeBounds, updateHistoryViewport],
+  );
+  const handleHistoryResetViewport = useCallback(() => {
+    setHistoryViewport(null);
+  }, []);
+  const handleHistoryZoom = useCallback(
+    (direction: "in" | "out") => {
+      if (!historyTimeBounds) {
+        return;
+      }
+      const activeDomain = historyViewport ?? historyDefaultDomain;
+      if (!activeDomain) {
+        return;
+      }
+      const [start, end] = activeDomain;
+      const currentSpan = Math.max(end - start, MIN_HISTORY_WINDOW_MS);
+      const totalSpan = Math.max(
+        historyTimeBounds[1] - historyTimeBounds[0],
+        MIN_HISTORY_WINDOW_MS,
+      );
+      if (totalSpan === 0) {
+        return;
+      }
+      const zoomFactor = direction === "in" ? 0.75 : 1.25;
+      const nextSpan = Math.min(
+        Math.max(currentSpan * zoomFactor, MIN_HISTORY_WINDOW_MS),
+        totalSpan,
+      );
+      const center = start + currentSpan / 2;
+      const nextDomain: [number, number] = [
+        center - nextSpan / 2,
+        center + nextSpan / 2,
+      ];
+      updateHistoryViewport(nextDomain);
+    },
+    [historyDefaultDomain, historyTimeBounds, historyViewport, updateHistoryViewport],
+  );
+  const handleHistoryWheel = useCallback(
+    (event: WheelEvent<HTMLDivElement>) => {
+      if (!historyData?.length || !historyTimeBounds) {
+        return;
+      }
+      const activeDomain = historyViewport ?? historyDefaultDomain;
+      if (!activeDomain) {
+        return;
+      }
+      const totalSpan = Math.max(
+        historyTimeBounds[1] - historyTimeBounds[0],
+        MIN_HISTORY_WINDOW_MS,
+      );
+      if (totalSpan === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      const [start, end] = activeDomain;
+      const currentSpan = Math.max(end - start, MIN_HISTORY_WINDOW_MS);
+      const shouldPan =
+        event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY);
+
+      if (shouldPan) {
+        const rawDelta = event.deltaX || event.deltaY;
+        if (rawDelta === 0) {
+          return;
+        }
+        const shiftRatio = rawDelta / HISTORY_PAN_SENSITIVITY;
+        if (shiftRatio === 0) {
+          return;
+        }
+        const shift = currentSpan * shiftRatio;
+        updateHistoryViewport([start + shift, end + shift]);
+        return;
+      }
+
+      if (event.deltaY === 0) {
+        return;
+      }
+
+      const zoomDirection = Math.sign(event.deltaY);
+      const nextSpan = Math.min(
+        Math.max(
+          currentSpan * (1 + HISTORY_WHEEL_ZOOM_STEP * zoomDirection),
+          MIN_HISTORY_WINDOW_MS,
+        ),
+        totalSpan,
+      );
+      const container = historyChartWrapperRef.current;
+      let focusRatio = 0.5;
+      if (container) {
+        const rect = container.getBoundingClientRect();
+        if (rect.width > 0) {
+          const relativeX = Math.min(
+            Math.max(event.clientX - rect.left, 0),
+            rect.width,
+          );
+          focusRatio = relativeX / rect.width;
+        }
+      }
+      const focusPoint = start + currentSpan * focusRatio;
+      const nextDomain: [number, number] = [
+        focusPoint - nextSpan * focusRatio,
+        focusPoint + nextSpan * (1 - focusRatio),
+      ];
+      updateHistoryViewport(nextDomain);
+    },
+    [
+      historyData,
+      historyDefaultDomain,
+      historyTimeBounds,
+      historyViewport,
+      updateHistoryViewport,
+    ],
   );
 
   const sortedRows = useMemo(() => {
@@ -637,41 +959,6 @@ export function PerpTable({
     return <ChevronDown className={`${baseIconClasses} opacity-0`} />;
   };
 
-  const renderPriceChange = (value: number | null) => {
-    if (typeof value !== "number" || !Number.isFinite(value)) {
-      return (
-        <span className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground">
-          —
-        </span>
-      );
-    }
-
-    if (value > 0) {
-      return (
-        <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-500 tabular-nums">
-          <ArrowUpRight className="h-3 w-3" />
-          {formatPercentChange(value)}
-        </span>
-      );
-    }
-
-    if (value < 0) {
-      return (
-        <span className="inline-flex items-center gap-1 text-xs font-semibold text-rose-500 tabular-nums">
-          <ArrowDownRight className="h-3 w-3" />
-          {formatPercentChange(value)}
-        </span>
-      );
-    }
-
-    return (
-      <span className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground tabular-nums">
-        <Minus className="h-3 w-3" />
-        {formatPercentChange(value)}
-      </span>
-    );
-  };
-
   const sortedLength = sortedRows.length;
   const pageCount = Math.max(1, Math.ceil(sortedLength / pageSize));
   const currentPage = Math.min(page, pageCount);
@@ -700,6 +987,7 @@ export function PerpTable({
     const cacheKey = getHistoryCacheKey(
       historyTarget.symbol,
       historyTarget.binanceSymbol,
+      historyTarget.binanceFundingPeriodHours,
     );
     const cached =
       historyCacheRef.current[cacheKey]?.[historyRangeDays] ?? null;
@@ -718,6 +1006,7 @@ export function PerpTable({
       historyTarget.symbol,
       historyTarget.binanceSymbol,
       historyRangeDays,
+      historyTarget.binanceFundingPeriodHours,
     )
       .then((dataset) => {
         if (cancelled) {
@@ -1105,315 +1394,17 @@ export function PerpTable({
                   </TableCell>
                 </TableRow>
               ) : (
-                currentRows.map((row) => {
-                  const hyperliquidHourly =
-                    liveFunding.hyperliquid[row.symbol] ?? row.fundingRate;
-                  const aggregatedFunding =
-                    hyperliquidHourly * displayPeriodHours;
-                  const hyperEightHourFunding =
-                    hyperliquidHourly * ARBITRAGE_COLOR_WINDOW_HOURS;
-                  const binanceSettlementLabel = formatSettlementPeriod(
-                    row.binance?.fundingPeriodHours ?? null,
-                  );
-                  const marketUrl = `https://app.hyperliquid.xyz/trade/${encodeURIComponent(
-                    row.symbol,
-                  )}`;
-                  const coingeckoUrl = row.coingeckoId
-                    ? `https://www.coingecko.com/en/coins/${encodeURIComponent(
-                        row.coingeckoId,
-                      )}`
-                    : null;
-                  const binanceHourly =
-                    row.binance?.symbol
-                      ? liveFunding.binance[row.binance.symbol] ??
-                        row.binance.fundingRate ??
-                        null
-                      : null;
-                  const binanceFundingAggregated =
-                    binanceHourly !== null
-                      ? binanceHourly * displayPeriodHours
-                      : null;
-                  const binanceEightHourFunding =
-                    binanceHourly !== null
-                      ? binanceHourly * ARBITRAGE_COLOR_WINDOW_HOURS
-                      : null;
-                  const binanceVolume = row.binance?.volumeUsd ?? null;
-                  const hourlyArbDelta =
-                    binanceHourly !== null
-                      ? binanceHourly - hyperliquidHourly
-                      : null;
-                  const absArbDelta =
-                    hourlyArbDelta !== null ? Math.abs(hourlyArbDelta) : null;
-                  const colorArbDelta =
-                    hourlyArbDelta !== null
-                      ? hourlyArbDelta * ARBITRAGE_COLOR_WINDOW_HOURS
-                      : null;
-                  const colorAbsArbDelta =
-                    colorArbDelta !== null ? Math.abs(colorArbDelta) : null;
-
-                let arbitrageBadgeClass =
-                  "border-border bg-muted/80 text-muted-foreground";
-                let hyperDirClass = "text-muted-foreground";
-                let binanceDirClass = "text-muted-foreground";
-                let hyperDirLabel = "—";
-                let binanceDirLabel = "—";
-                const isSmallArbitrage =
-                  colorAbsArbDelta !== null && colorAbsArbDelta < 0.0001;
-
-                if (colorArbDelta !== null) {
-                  if (colorArbDelta > 0) {
-                    hyperDirLabel = "做多";
-                    hyperDirClass = "text-emerald-500";
-                    binanceDirLabel = "做空";
-                    binanceDirClass = "text-red-500";
-                  } else if (colorArbDelta < 0) {
-                    hyperDirLabel = "做空";
-                    hyperDirClass = "text-red-500";
-                    binanceDirLabel = "做多";
-                    binanceDirClass = "text-emerald-500";
-                  }
-
-                  if (isSmallArbitrage) {
-                    arbitrageBadgeClass =
-                      "border-border bg-muted/80 text-muted-foreground";
-                  } else if (colorArbDelta > 0) {
-                    arbitrageBadgeClass =
-                      "border-emerald-200 bg-emerald-50 text-emerald-600";
-                  } else if (colorArbDelta < 0) {
-                    arbitrageBadgeClass =
-                      "border-red-200 bg-red-50 text-red-600";
-                  }
-                }
-
-                return (
-                  <TableRow key={row.symbol} className="hover:bg-muted/40">
-                    <TableCell className="py-3 text-sm font-semibold text-foreground min-w-[190px]">
-                      {coingeckoUrl ? (
-                        <div className="flex items-center gap-2.5">
-                          <a
-                            href={coingeckoUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full border border-border/30 bg-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
-                          >
-                            {row.iconUrl ? (
-                              <img
-                                src={row.iconUrl}
-                                alt={`${row.displayName} 图标`}
-                                className="h-full w-full rounded-full object-contain"
-                                loading="lazy"
-                              />
-                            ) : (
-                              <span className="text-[10px] font-medium uppercase text-muted-foreground">
-                                {row.symbol.slice(0, 3)}
-                              </span>
-                            )}
-                          </a>
-                          <div className="flex flex-col overflow-hidden">
-                            <a
-                              href={coingeckoUrl}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="truncate text-sm font-semibold text-foreground transition hover:text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-                            >
-                              {row.displayName}
-                            </a>
-                            <span className="truncate text-[11px] uppercase text-muted-foreground">
-                              {row.symbol}
-                            </span>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="flex items-center gap-2.5">
-                          {row.iconUrl ? (
-                            <img
-                              src={row.iconUrl}
-                              alt={`${row.displayName} 图标`}
-                              className="h-7 w-7 flex-shrink-0 rounded-full border border-border/30 bg-background object-contain"
-                              loading="lazy"
-                            />
-                          ) : (
-                            <div className="flex h-7 w-7 items-center justify-center rounded-full border border-border/60 bg-muted text-[10px] font-medium uppercase text-muted-foreground">
-                              {row.symbol.slice(0, 3)}
-                            </div>
-                          )}
-                          <div className="flex flex-col overflow-hidden">
-                            <span className="truncate text-sm font-semibold text-foreground">
-                              {row.displayName}
-                            </span>
-                            <span className="truncate text-[11px] uppercase text-muted-foreground">
-                              {row.symbol}
-                            </span>
-                          </div>
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell className="font-medium tabular-nums text-sm">
-                      {formatPrice(row.markPrice)}
-                    </TableCell>
-                    <TableCell className="text-xs font-medium">
-                      {renderPriceChange(row.priceChange1h)}
-                    </TableCell>
-                    <TableCell className="text-xs font-medium">
-                      {renderPriceChange(row.priceChange24h)}
-                    </TableCell>
-                    <TableCell className="text-xs font-medium">
-                      {renderPriceChange(row.priceChange7d)}
-                    </TableCell>
-                    <TableCell className="font-medium tabular-nums text-sm">
-                      {row.maxLeverage}倍
-                    </TableCell>
-                    <TableCell>
-                      <Tooltip delayDuration={100}>
-                        <TooltipTrigger asChild>
-                          <a
-                            href={marketUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex"
-                          >
-                            <Badge
-                              variant="secondary"
-                              className={cn(
-                                "font-medium text-xs",
-                                getFundingBadgeClass(hyperEightHourFunding),
-                              )}
-                            >
-                              {formatFundingRate(aggregatedFunding)}
-                            </Badge>
-                          </a>
-                        </TooltipTrigger>
-                        <TooltipContent side="top">
-                          <p>{describeFundingDirection(aggregatedFunding)}</p>
-                          <p className="mt-1 text-[10px] text-muted-foreground">
-                            {formatAnnualizedFunding(hyperliquidHourly)}
-                          </p>
-                        </TooltipContent>
-                      </Tooltip>
-                    </TableCell>
-                    <TableCell>
-                      {binanceFundingAggregated !== null &&
-                      row.binance?.symbol ? (
-                        <Tooltip delayDuration={100}>
-                          <TooltipTrigger asChild>
-                            <a
-                              href={`https://www.binance.com/zh-CN/futures/${row.binance.symbol}`}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="inline-flex"
-                            >
-                              <Badge
-                                variant="secondary"
-                                className={cn(
-                                  "font-medium text-xs",
-                                  getFundingBadgeClass(
-                                    binanceEightHourFunding ?? 0,
-                                  ),
-                                )}
-                              >
-                                {formatFundingRate(binanceFundingAggregated)}
-                              </Badge>
-                            </a>
-                          </TooltipTrigger>
-                          <TooltipContent side="top">
-                            <p>
-                              {describeFundingDirection(
-                                binanceFundingAggregated,
-                              )}
-                            </p>
-                            <p className="mt-1 text-[10px] text-muted-foreground">
-                              {formatAnnualizedFunding(binanceHourly ?? 0)}
-                            </p>
-                          </TooltipContent>
-                        </Tooltip>
-                      ) : (
-                        <Badge
-                          variant="secondary"
-                          className="font-medium text-xs border-border bg-muted/80 text-muted-foreground"
-                        >
-                          —
-                        </Badge>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {absArbDelta !== null ? (
-                        <Tooltip delayDuration={100}>
-                          <TooltipTrigger asChild>
-                            <Badge
-                              variant="secondary"
-                              className={cn(
-                                "font-medium text-xs",
-                                arbitrageBadgeClass,
-                              )}
-                            >
-                              {formatFundingRate(absArbDelta)}
-                            </Badge>
-                          </TooltipTrigger>
-                          <TooltipContent side="top">
-                            <p className="text-[10px] text-muted-foreground">
-                              {isSmallArbitrage
-                                ? "套利空间（8h） < 0.01% · "
-                                : ""}
-                              Hyperliquid{" "}
-                              <span className={hyperDirClass}>
-                                {hyperDirLabel}
-                              </span>{" "}
-                              · Binance{" "}
-                              <span className={binanceDirClass}>
-                                {binanceDirLabel}
-                              </span>
-                            </p>
-                            <p className="mt-1 text-[10px] text-muted-foreground">
-                              年化{" "}
-                              {computeAnnualizedPercent(absArbDelta)}
-                            </p>
-                          </TooltipContent>
-                        </Tooltip>
-                      ) : (
-                        <Badge
-                          variant="secondary"
-                          className="font-medium text-xs border-border bg-muted/80 text-muted-foreground"
-                        >
-                          —
-                        </Badge>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-xs font-medium text-muted-foreground whitespace-nowrap">
-                      {hyperliquidSettlementLabel}
-                    </TableCell>
-                    <TableCell className="text-xs font-medium text-muted-foreground whitespace-nowrap">
-                      {binanceSettlementLabel}
-                    </TableCell>
-                  <TableCell className="font-medium">
-                    {row.dayNotionalVolume !== null
-                      ? formatVolume(row.dayNotionalVolume)
-                      : "—"}
-                  </TableCell>
-                  <TableCell className="font-medium">
-                    {binanceVolume !== null ? formatVolume(binanceVolume) : "—"}
-                  </TableCell>
-                  <TableCell className="text-xs">
-                    <Tooltip delayDuration={100}>
-                      <TooltipTrigger asChild>
-                        <Button
-                          variant="outline"
-                          size="icon"
-                          className="h-8 w-8"
-                          onClick={() => handleHistoryClick(row)}
-                          aria-label="查看资金费率历史"
-                        >
-                          <LineChartIcon className="h-4 w-4" />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent side="top">
-                        查看资金费率历史
-                      </TooltipContent>
-                    </Tooltip>
-                  </TableCell>
-                </TableRow>
-              );
-            })
-          )}
+                currentRows.map((row) => (
+                  <PerpTableRow
+                    key={row.symbol}
+                    row={row}
+                    liveFunding={liveFunding}
+                    displayPeriodHours={displayPeriodHours}
+                    hyperliquidSettlementLabel={hyperliquidSettlementLabel}
+                    onHistoryClick={handleHistoryClick}
+                  />
+                ))
+              )}
             </TableBody>
           </Table>
         </div>
@@ -1503,6 +1494,35 @@ export function PerpTable({
               );
             })}
           </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => handleHistoryZoom("in")}
+              disabled={historyInteractionsDisabled}
+            >
+              放大
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => handleHistoryZoom("out")}
+              disabled={historyInteractionsDisabled}
+            >
+              缩小
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={handleHistoryResetViewport}
+              disabled={historyInteractionsDisabled || historyViewport === null}
+            >
+              重置视图
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              鼠标滚轮缩放，按住 Shift 或横向滚动可平移
+            </span>
+          </div>
           {historyLoading ? (
             <div className="flex h-72 items-center justify-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -1513,25 +1533,54 @@ export function PerpTable({
               {historyError}
             </div>
           ) : historyData?.length ? (
-            <div className="h-[480px] w-full">
+            <div
+              className="h-[480px] w-full"
+              ref={historyChartWrapperRef}
+              onWheel={
+                historyInteractionsDisabled ? undefined : handleHistoryWheel
+              }
+            >
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={historyData} margin={{ top: 12, right: 16, left: 0, bottom: 8 }}>
                   <CartesianGrid strokeDasharray="3 3" className="text-muted-foreground/20" />
                   <XAxis
                     dataKey="time"
                     type="number"
+                    scale="time"
+                    allowDataOverflow
                     tickFormatter={(value) => historyTickFormatter.format(value)}
-                    domain={["auto", "auto"]}
+                    domain={
+                      historyXAxisDomain
+                        ? [historyXAxisDomain[0], historyXAxisDomain[1]]
+                        : ["dataMin", "dataMax"]
+                    }
+                    padding={{ left: 0, right: 0 }}
                     tickMargin={8}
                     fontSize={12}
                   />
                   <YAxis
-                    tickFormatter={(value) => `${value.toFixed(3)}%`}
+                    tickFormatter={(value) => `${formatHistoryPercentValue(value)}%`}
                     fontSize={12}
                     width={60}
                   />
+                  <ReferenceLine
+                    y={0}
+                    stroke="#334155"
+                    strokeDasharray="6 4"
+                    strokeWidth={2}
+                    strokeOpacity={0.9}
+                  />
                   <RechartsTooltip
-                    formatter={(value: number) => `${value.toFixed(4)}%`}
+                    formatter={(value, name) => {
+                      const numericValue =
+                        typeof value === "number"
+                          ? value
+                          : Number.parseFloat(String(value));
+                      return [
+                        formatHistoryTooltipValue(numericValue),
+                        typeof name === "string" ? name : String(name ?? ""),
+                      ];
+                    }}
                     labelFormatter={(value) =>
                       historyTooltipFormatter.format(value as number)
                     }
@@ -1564,6 +1613,18 @@ export function PerpTable({
                     dot={false}
                     connectNulls
                   />
+                  {historyBrushState && historyData && historyData.length > 1 ? (
+                    <Brush
+                      dataKey="time"
+                      height={28}
+                      stroke="#94a3b8"
+                      travellerWidth={10}
+                      tickFormatter={() => ""}
+                      startIndex={historyBrushState.startIndex}
+                      endIndex={historyBrushState.endIndex}
+                      onChange={handleHistoryBrushChange}
+                    />
+                  ) : null}
                 </LineChart>
               </ResponsiveContainer>
             </div>
