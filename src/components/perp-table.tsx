@@ -373,7 +373,7 @@ async function fetchFundingHistoryDataset(
       typeof entry.hyperliquid === "number" &&
       typeof entry.binance === "number"
     ) {
-      entry.arbitrage = entry.hyperliquid - entry.binance;
+      entry.arbitrage = entry.binance - entry.hyperliquid;
     } else {
       entry.arbitrage = null;
     }
@@ -1140,7 +1140,7 @@ export function PerpTable({
                   const binanceVolume = row.binance?.volumeUsd ?? null;
                   const hourlyArbDelta =
                     binanceHourly !== null
-                      ? hyperliquidHourly - binanceHourly
+                      ? binanceHourly - hyperliquidHourly
                       : null;
                   const absArbDelta =
                     hourlyArbDelta !== null ? Math.abs(hourlyArbDelta) : null;
@@ -1162,15 +1162,15 @@ export function PerpTable({
 
                 if (colorArbDelta !== null) {
                   if (colorArbDelta > 0) {
-                    hyperDirLabel = "做空";
-                    hyperDirClass = "text-red-500";
-                    binanceDirLabel = "做多";
-                    binanceDirClass = "text-emerald-500";
-                  } else if (colorArbDelta < 0) {
                     hyperDirLabel = "做多";
                     hyperDirClass = "text-emerald-500";
                     binanceDirLabel = "做空";
                     binanceDirClass = "text-red-500";
+                  } else if (colorArbDelta < 0) {
+                    hyperDirLabel = "做空";
+                    hyperDirClass = "text-red-500";
+                    binanceDirLabel = "做多";
+                    binanceDirClass = "text-emerald-500";
                   }
 
                   if (isSmallArbitrage) {
@@ -1178,10 +1178,10 @@ export function PerpTable({
                       "border-border bg-muted/80 text-muted-foreground";
                   } else if (colorArbDelta > 0) {
                     arbitrageBadgeClass =
-                      "border-red-200 bg-red-50 text-red-600";
+                      "border-emerald-200 bg-emerald-50 text-emerald-600";
                   } else if (colorArbDelta < 0) {
                     arbitrageBadgeClass =
-                      "border-emerald-200 bg-emerald-50 text-emerald-600";
+                      "border-red-200 bg-red-50 text-red-600";
                   }
                 }
 
@@ -1558,7 +1558,7 @@ export function PerpTable({
                   <Line
                     type="monotone"
                     dataKey="arbitrage"
-                    name="套利空间（Hyper 空 / Binance 多）"
+                    name="套利空间（Hyper 多 / Binance 空）"
                     stroke="#ef4444"
                     strokeWidth={2}
                     dot={false}
