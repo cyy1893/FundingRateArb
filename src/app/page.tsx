@@ -466,11 +466,10 @@ async function DashboardContent() {
       <CardHeader className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div className="space-y-2">
           <CardTitle className="text-2xl font-semibold tracking-tight">
-            Hyperliquid 永续合约总览
+            资金费率比较
           </CardTitle>
           <CardDescription className="max-w-2xl text-sm text-muted-foreground">
-            极简 toB 面板展示 Hyperliquid 交易所永续合约的核心指标。数据实时获取自
-            Hyperliquid Info API。
+            各交易所资金费率的差异。
           </CardDescription>
         </div>
         <div className="rounded-lg border border-border/70 bg-muted/40 px-4 py-3 text-sm">
