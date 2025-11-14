@@ -46,6 +46,7 @@ import {
 } from "@/lib/funding";
 import { cn } from "@/lib/utils";
 import type { MarketRow } from "@/types/market";
+import type { FundingHistoryPoint, LiveFundingResponse } from "@/types/funding";
 import {
   Brush,
   CartesianGrid,
@@ -79,24 +80,6 @@ type SortColumn =
   | "volumeBinance";
 type ExchangeFilter = "intersection" | "any";
 
-type HyperliquidFundingResponse = [
-  {
-    universe: Array<{
-      name: string;
-    }>;
-  },
-  Array<{
-    funding: string;
-  }>
-];
-
-type FundingHistoryPoint = {
-  time: number;
-  hyperliquid?: number | null;
-  binance?: number | null;
-  arbitrage?: number | null;
-};
-
 const HISTORY_OPTIONS = [
   { label: "1 天", value: 1 },
   { label: "1 周", value: 7 },
@@ -111,9 +94,6 @@ type HistoryOptionValue = (typeof HISTORY_OPTIONS)[number]["value"];
 
 const DEFAULT_HISTORY_RANGE_DAYS: HistoryOptionValue = 7;
 const MS_PER_HOUR = 60 * 60 * 1000;
-const DEFAULT_BINANCE_FUNDING_PERIOD_HOURS = 8;
-const MAX_HYPER_FUNDING_POINTS = 500;
-const MAX_HYPER_LOOKBACK_MS = MAX_HYPER_FUNDING_POINTS * MS_PER_HOUR;
 const HOURS_PER_YEAR = 24 * 365;
 const MIN_HISTORY_WINDOW_MS = 3 * MS_PER_HOUR;
 const HISTORY_PAN_SENSITIVITY = 900;
@@ -247,199 +227,40 @@ function findNearestIndexByTime(
   return result;
 }
 
-async function fetchHyperliquidFundingRates(
-  symbols: string[],
-): Promise<Record<string, number>> {
-  if (symbols.length === 0) {
-    return {};
+async function fetchLiveFundingSnapshot(
+  hyperSymbols: string[],
+  binanceSymbols: string[],
+): Promise<LiveFundingResponse> {
+  if (hyperSymbols.length === 0 && binanceSymbols.length === 0) {
+    return { hyperliquid: {}, binance: {} };
   }
 
-  try {
-    const response = await fetch("https://api.hyperliquid.xyz/info", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ type: "metaAndAssetCtxs" }),
-      cache: "no-store",
-    });
-
-    if (!response.ok) {
-      return {};
-    }
-
-    const data = (await response.json()) as unknown;
-    if (!Array.isArray(data) || data.length < 2) {
-      return {};
-    }
-
-    const [meta, contexts] = data as HyperliquidFundingResponse;
-    const targetSymbols = new Set(
-      symbols.map((symbol) => symbol.toUpperCase()),
-    );
-
-    const funding: Record<string, number> = {};
-    meta.universe.forEach((asset, index) => {
-      if (!targetSymbols.has(asset.name)) {
-        return;
-      }
-
-      const rawFunding = contexts[index]?.funding;
-      const parsed = Number.parseFloat(rawFunding ?? "");
-      if (Number.isFinite(parsed)) {
-        funding[asset.name] = parsed;
-      }
-    });
-
-    return funding;
-  } catch {
-    return {};
-  }
-}
-
-async function fetchBinanceFundingRates(
-  symbols: string[],
-): Promise<Record<string, number>> {
-  if (symbols.length === 0) {
-    return {};
-  }
-
-  try {
-    const [premiumRes, fundingInfoRes] = await Promise.all([
-      fetch("https://fapi.binance.com/fapi/v1/premiumIndex", {
-        cache: "no-store",
-      }),
-      fetch("https://fapi.binance.com/fapi/v1/fundingInfo", {
-        cache: "no-store",
-      }),
-    ]);
-
-    if (!premiumRes.ok) {
-      return {};
-    }
-
-    const data = (await premiumRes.json()) as Array<{
-      symbol: string;
-      lastFundingRate: string;
-    }>;
-
-    const targetSymbols = new Set(symbols);
-    const funding: Record<string, number> = {};
-    const intervalMap: Record<string, number> = {};
-
-    if (fundingInfoRes.ok) {
-      const fundingInfo = (await fundingInfoRes.json()) as Array<{
-        symbol: string;
-        fundingIntervalHours?: number | string;
-      }>;
-
-      fundingInfo?.forEach((item) => {
-        if (!targetSymbols.has(item.symbol)) {
-          return;
-        }
-
-        const hours =
-          typeof item.fundingIntervalHours === "string"
-            ? Number.parseInt(item.fundingIntervalHours, 10)
-            : item.fundingIntervalHours;
-        if (hours != null && Number.isFinite(hours)) {
-          intervalMap[item.symbol] = hours;
-        }
-      });
-    }
-
-    data.forEach((item) => {
-      if (!targetSymbols.has(item.symbol)) {
-        return;
-      }
-
-      const parsed = Number.parseFloat(item.lastFundingRate);
-      if (Number.isFinite(parsed)) {
-        const intervalHours = intervalMap[item.symbol] ?? DEFAULT_FUNDING_PERIOD_HOURS;
-        funding[item.symbol] = parsed / Math.max(intervalHours, 1);
-      }
-    });
-
-    return funding;
-  } catch {
-    return {};
-  }
-}
-
-function normalizeTimestampToHour(value: number): number {
-  return Math.floor(value / MS_PER_HOUR) * MS_PER_HOUR;
-}
-
-async function fetchHyperliquidFundingHistorySeries(
-  symbol: string,
-  startTime: number,
-): Promise<Array<{ time: number; rate: number }>> {
-  const response = await fetch("https://api.hyperliquid.xyz/info", {
+  const response = await fetch("/api/funding/live", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      type: "fundingHistory",
-      coin: symbol,
-      startTime,
-    }),
-    cache: "no-store",
+    body: JSON.stringify({ hyperSymbols, binanceSymbols }),
   });
 
   if (!response.ok) {
-    throw new Error("Hyperliquid 资金费率历史请求失败");
+    let message = "获取资金费率失败，请稍后重试。";
+    try {
+      const errorBody = (await response.json()) as { error?: string };
+      if (typeof errorBody?.error === "string") {
+        message = errorBody.error;
+      }
+    } catch {
+      // ignore parse errors
+    }
+    throw new Error(message);
   }
 
-  const data = (await response.json()) as Array<{
-    time: number;
-    fundingRate: string;
-  }>;
-
-  return data
-    .map((entry) => {
-      const time = normalizeTimestampToHour(entry.time);
-      const rate = Number.parseFloat(entry.fundingRate);
-      return Number.isFinite(rate) ? { time, rate } : null;
-    })
-    .filter((point): point is { time: number; rate: number } => point !== null);
-}
-
-async function fetchBinanceFundingHistorySeries(
-  symbol: string,
-  startTime: number,
-): Promise<Array<{ time: number; rate: number }>> {
-  const params = new URLSearchParams({
-    symbol,
-    limit: "1000",
-  });
-  if (Number.isFinite(startTime)) {
-    params.set("startTime", `${startTime}`);
-  }
-
-  const response = await fetch(
-    `https://fapi.binance.com/fapi/v1/fundingRate?${params.toString()}`,
-    {
-      cache: "no-store",
-    },
-  );
-
-  if (!response.ok) {
-    throw new Error("Binance 资金费率历史请求失败");
-  }
-
-  const data = (await response.json()) as Array<{
-    fundingRate: string;
-    fundingTime: number;
-  }>;
-
-  return data
-    .map((entry) => {
-      const time = normalizeTimestampToHour(entry.fundingTime);
-      const rate = Number.parseFloat(entry.fundingRate);
-      return Number.isFinite(rate) ? { time, rate } : null;
-    })
-    .filter((point): point is { time: number; rate: number } => point !== null);
+  const data = (await response.json()) as Partial<LiveFundingResponse>;
+  return {
+    hyperliquid: data.hyperliquid ?? {},
+    binance: data.binance ?? {},
+  };
 }
 
 async function fetchFundingHistoryDataset(
@@ -448,72 +269,43 @@ async function fetchFundingHistoryDataset(
   days: number,
   binanceFundingPeriodHours: number | null,
 ): Promise<FundingHistoryPoint[]> {
-  const now = Date.now();
-  const desiredStart = now - days * 24 * MS_PER_HOUR;
-  const latestAllowedStart = now - MAX_HYPER_LOOKBACK_MS;
-  const startTime = Math.max(desiredStart, latestAllowedStart);
-  const [hyperHistory, binanceHistory] = await Promise.all([
-    fetchHyperliquidFundingHistorySeries(symbol, startTime).catch(() => []),
-    binanceSymbol
-      ? fetchBinanceFundingHistorySeries(binanceSymbol, startTime).catch(
-          () => [],
-        )
-      : Promise.resolve([]),
-  ]);
-
-  if (hyperHistory.length === 0 && binanceHistory.length === 0) {
-    throw new Error("暂无可用的资金费率历史数据");
-  }
-
-  const sortedHyper = [...hyperHistory].sort((a, b) => a.time - b.time);
-  const sortedBinance = [...binanceHistory].sort((a, b) => a.time - b.time);
-  const intervalHours = Math.max(
-    binanceFundingPeriodHours ?? DEFAULT_BINANCE_FUNDING_PERIOD_HOURS,
-    1,
-  );
-
-  if (sortedHyper.length === 0) {
-    return sortedBinance
-      .map(({ time, rate }) => ({
-        time,
-        hyperliquid: null,
-        binance: (rate / intervalHours) * 100,
-        arbitrage: null,
-      }))
-      .sort((a, b) => a.time - b.time);
-  }
-
-  const dataset: FundingHistoryPoint[] = [];
-  let binanceIndex = 0;
-  let currentBinanceHourly: number | null = null;
-
-  sortedHyper.forEach(({ time, rate }) => {
-    while (
-      binanceIndex < sortedBinance.length &&
-      sortedBinance[binanceIndex].time <= time
-    ) {
-      const hourly = (sortedBinance[binanceIndex].rate / intervalHours) * 100;
-      if (Number.isFinite(hourly)) {
-        currentBinanceHourly = hourly;
-      }
-      binanceIndex += 1;
-    }
-
-    const hyperValue = rate * 100;
-    const binanceValue = currentBinanceHourly;
-
-    dataset.push({
-      time,
-      hyperliquid: hyperValue,
-      binance: binanceValue,
-      arbitrage:
-        typeof binanceValue === "number"
-          ? binanceValue - hyperValue
-          : null,
-    });
+  const fallbackMessage = "获取资金费率历史失败，请稍后重试。";
+  const response = await fetch("/api/funding/history", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      symbol,
+      binanceSymbol,
+      days,
+      binanceFundingPeriodHours,
+    }),
   });
 
-  return dataset;
+  if (!response.ok) {
+    let message = fallbackMessage;
+    try {
+      const errorBody = (await response.json()) as { error?: string };
+      if (typeof errorBody?.error === "string" && errorBody.error.length > 0) {
+        message = errorBody.error;
+      }
+    } catch {
+      // ignore parse errors and fall back to default message
+    }
+    throw new Error(message);
+  }
+
+  const data = (await response.json()) as {
+    dataset?: FundingHistoryPoint[];
+    error?: string;
+  };
+
+  if (!data.dataset) {
+    throw new Error(data.error ?? fallbackMessage);
+  }
+
+  return data.dataset;
 }
 
 function getHistoryCacheKey(
@@ -1102,14 +894,14 @@ export function PerpTable({
 
       isFetchingRef.current = true;
       try {
-        const [hyperRates, binanceRates] = await Promise.all([
-          fetchHyperliquidFundingRates(hyperSymbols),
-          fetchBinanceFundingRates(binanceSymbols),
-        ]);
+        const snapshot = await fetchLiveFundingSnapshot(
+          hyperSymbols,
+          binanceSymbols,
+        );
 
         setLiveFunding({
-          hyperliquid: hyperRates,
-          binance: binanceRates,
+          hyperliquid: snapshot.hyperliquid,
+          binance: snapshot.binance,
         });
         lastFetchRef.current = Date.now();
       } catch {
